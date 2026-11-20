@@ -1,1 +1,20 @@
+# CMake and Visual Studio build output
 /build/
+/out/
+/cmake-build-*/
+/CMakeCache.txt
+/CMakeFiles/
+/CMakeUserPresets.json
+.vs/
+*.vcxproj.user
+*.vst3
+
+# Local REAPER sessions, recordings, and caches
+/UserTestProject/
+/01-261119_1001 - Pad Trigger hi-hat.wav
+*.[Rr][Pp][Pp]-[Bb][Aa][Kk]
+*.[Rr][Ee][Aa][Pp][Ee][Aa][Kk][Ss]
+
+# Windows Explorer metadata
+Thumbs.db
+Desktop.ini
