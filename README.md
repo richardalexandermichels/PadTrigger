@@ -2,6 +2,8 @@
 
 Padomizer is a Windows x64 VST3 audio effect for a microphone pointed at a drum practice pad. Each detected strike either plays a WAV at a velocity-sensitive level or generates a pitched MIDI note for a downstream instrument.
 
+See [Padomizer Design and Implementation](DESIGN.md) for the DSP, MIDI and modulation behavior, host routing, state format, and reviewer test plan.
+
 ## Set up REAPER
 
 1. In **Options → Preferences → Plug-ins → VST**, add the directory containing the new `Pad Trigger.vst3` bundle and re-scan. The Ninja build in this workspace is under `build/ninja/PadTrigger_artefacts/Release/VST3`. You can also copy the entire bundle folder into your usual VST3 folder. The bundle still uses the filename `Pad Trigger.vst3` and the original VST3 ID so saved projects and templates can find it. REAPER lists newly scanned instances as **Padomizer**.
