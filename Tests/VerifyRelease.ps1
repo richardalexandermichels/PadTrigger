@@ -21,6 +21,9 @@ if ($metadata -notmatch '(?m)^JUCE: [0-9a-f]{40} \(') {
 
 $templates = @{
     'Padomizer - One-track MIDI'           = '(?m)^\s*REC 0 0 2 4 0 0 0 1\s*$'
+    'Padomizer - Melodic Pluck'            = '(?m)^\s*REC 0 0 2 4 0 0 0 1\s*$'
+    'Padomizer - Bass Pulse'              = '(?m)^\s*REC 0 0 2 4 0 0 0 1\s*$'
+    'Padomizer - Mallet Answer'           = '(?m)^\s*REC 0 0 2 4 0 0 0 1\s*$'
     'Padomizer - Single drum note'         = '(?m)^\s*REC 0 0 2 4 0 0 0 1\s*$'
     'PadTrigger - One-track stereo'       = '(?m)^\s*REC 0 0 2 3 0 0 0 2\s*$'
     'PadTrigger - sforzando Stereo Print' = '(?m)^\s*REC 0 -1 1 3 0 0 0 2\s*$'

@@ -92,7 +92,7 @@ std::vector<int> notePitches(const juce::MidiBuffer& midi)
 
 void checkMidiPatterns()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     setParameter(plugin, "soundMode", 1.0f);
     setParameter(plugin, "noteLengthMs", 20.0f);
@@ -135,7 +135,7 @@ void checkMidiPatterns()
 
     juce::MemoryBlock saved;
     plugin.getStateInformation(saved);
-    PadTrigger restored;
+    PadTrigger restored(PadTrigger::InitialSetup::legacy);
     restored.setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
     restored.prepareToPlay(rate, blockSize);
     require(restored.midiNotes.poolNames()[restored.midiNotes.selectedPool()] == "My Vital pool",
@@ -178,7 +178,7 @@ void checkMidiPatterns()
 
 void checkRetrigger()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     setParameter(plugin, "soundMode", 1.0f);
     setParameter(plugin, "patternLength", 8.0f);
@@ -205,7 +205,7 @@ void checkRetrigger()
 
 void checkVelocityFloor()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     setParameter(plugin, "soundMode", 1.0f);
     setParameter(plugin, "sensitivity", 12.0f);
@@ -235,7 +235,7 @@ void checkVelocityFloor()
 
     juce::MemoryBlock saved;
     plugin.getStateInformation(saved);
-    PadTrigger restored;
+    PadTrigger restored(PadTrigger::InitialSetup::legacy);
     restored.setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
     require(restored.settings.getRawParameterValue("velocityFloor")->load() == 127.0f, "MIDI floor did not recall");
     auto oldState = juce::XmlElement("PadTrigger");
@@ -246,7 +246,7 @@ void checkVelocityFloor()
 
 void checkVelocityDecisionWindow()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     setParameter(plugin, "soundMode", 1.0f);
     juce::MidiBuffer midi;
@@ -266,7 +266,7 @@ void checkVelocityDecisionWindow()
 
 void checkPadRinging()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     setParameter(plugin, "soundMode", 1.0f);
     setParameter(plugin, "retriggerMs", 8.0f);
@@ -297,7 +297,7 @@ void checkHardStrikeRinging()
     {
         for (const bool playSecond : {false, true})
         {
-            PadTrigger plugin;
+            PadTrigger plugin(PadTrigger::InitialSetup::legacy);
             plugin.prepareToPlay(rate, blockSize);
             setParameter(plugin, "soundMode", 1.0f);
             setParameter(plugin, "retriggerMs", retrigger);
@@ -450,7 +450,7 @@ void checkHostBlockLatency()
     {
         for (const int size : {32, 128, 1024})
         {
-            PadTrigger plugin;
+            PadTrigger plugin(PadTrigger::InitialSetup::legacy);
             setParameter(plugin, "soundMode", 1.0f);
             // Put the first hit at the end of a block, and the accent on another boundary.
             const int first = size - 1;
@@ -482,7 +482,7 @@ void checkModulatedHitTiming()
 {
     const auto render = [](int size)
     {
-        PadTrigger plugin;
+        PadTrigger plugin(PadTrigger::InitialSetup::legacy);
         setParameter(plugin, "soundMode", 1.0f);
         setParameter(plugin, "lfoShape", 4.0f);
         setParameter(plugin, "lfoSeconds", 0.064f);
@@ -519,7 +519,7 @@ void checkModulatedHitTiming()
 
 void checkMidiPitch()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     setParameter(plugin, "soundMode", 1.0f);
     setParameter(plugin, "patternLength", 1.0f);
     setParameter(plugin, "lfoShape", 4.0f);
@@ -566,7 +566,7 @@ void checkMidiPitch()
     setParameter(plugin, "bendRange", 12.0f);
     juce::MemoryBlock state;
     plugin.getStateInformation(state);
-    PadTrigger restored;
+    PadTrigger restored(PadTrigger::InitialSetup::legacy);
     restored.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
     require(restored.settings.getRawParameterValue("pitchCents")->load() == 25.0f
             && restored.settings.getRawParameterValue("pitchSemitones")->load() == 12.0f
@@ -577,7 +577,7 @@ void checkMidiPitch()
 
 void checkSelfContainedPitchBend()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     setParameter(plugin, "soundMode", 1.0f);
     setParameter(plugin, "pitchCents", 50.0f);
@@ -609,7 +609,7 @@ void checkConcurrentPatternRestore()
 {
     const auto makeState = [](int length, int pitch)
     {
-        PadTrigger fixture;
+        PadTrigger fixture(PadTrigger::InitialSetup::legacy);
         setParameter(fixture, "soundMode", 1.0f);
         setParameter(fixture, "patternLength", static_cast<float>(length));
         setParameter(fixture, "retriggerMs", 8.0f);
@@ -626,7 +626,7 @@ void checkConcurrentPatternRestore()
     };
     const auto shorter = makeState(1, 60);
     const auto longer = makeState(4, 64);
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     plugin.setStateInformation(shorter.getData(), static_cast<int>(shorter.getSize()));
     std::atomic<bool> started { false };
@@ -675,7 +675,7 @@ void checkConcurrentPatternRestore()
 
 void checkNoteRate()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     setParameter(plugin, "soundMode", 1.0f);
     setParameter(plugin, "noteLengthMs", 350.0f);
     plugin.prepareToPlay(rate, blockSize);
@@ -697,7 +697,7 @@ void checkLfoAndPattern()
         PositionInfo position;
         juce::Optional<PositionInfo> getPosition() const override { return position; }
     } host;
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     require(plugin.settings.getParameter("autoRetrigger") == nullptr, "Removed Auto parameter still exists");
     setParameter(plugin, "lfoSeconds", 0.125f);
@@ -744,7 +744,7 @@ void checkLfoAndPattern()
 
     juce::MemoryBlock state;
     plugin.getStateInformation(state);
-    PadTrigger recalled;
+    PadTrigger recalled(PadTrigger::InitialSetup::legacy);
     recalled.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
     require(recalled.settings.getRawParameterValue("lfoPattern")->load() == 100.0f
             && recalled.settings.getRawParameterValue("lfoVelocity")->load() == 30.0f,
@@ -791,7 +791,7 @@ void checkLfoPatternPosition()
         }, &midi);
         return midi;
     };
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     setParameter(plugin, "soundMode", 1.0f);
     setParameter(plugin, "patternLength", 4.0f);
     setParameter(plugin, "lfoSeconds", 1.0f);
@@ -805,7 +805,7 @@ void checkLfoPatternPosition()
 
     juce::MemoryBlock state;
     plugin.getStateInformation(state);
-    PadTrigger recalled;
+    PadTrigger recalled(PadTrigger::InitialSetup::legacy);
     recalled.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
     require(recalled.settings.getRawParameterValue("lfoPatternPosition")->load() == 100.0f
             && notePitches(play(recalled, 100.0f)) == pitches,
@@ -834,7 +834,7 @@ void checkLfoPatternPosition()
 
 void checkPoolLearn()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     juce::AudioBuffer<float> input(2, blockSize);
     input.clear();
@@ -896,7 +896,7 @@ void checkPoolLearn()
             "Free play used a disabled key before the set was saved");
     juce::MemoryBlock state;
     plugin.getStateInformation(state);
-    PadTrigger recalled;
+    PadTrigger recalled(PadTrigger::InitialSetup::legacy);
     recalled.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
     const auto edits = recalled.midiNotes.selectedPoolDetails().edits;
     require(edits && edits->count() == 7 && !edits->test(64), "Project recall lost the working note selection");
@@ -944,7 +944,7 @@ void calibrate(PadTrigger& plugin)
 
 void checkCalibrationWithLateAccentPeak()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     plugin.advanceCalibration();
     process(plugin, 2 * rate, noise);
@@ -995,7 +995,7 @@ void checkProjectEditNotifications(const juce::File& sample)
         int changes = 0;
     } listener;
 
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.addListener(&listener);
     plugin.prepareToPlay(rate, blockSize);
     require(plugin.loadSample(sample).wasOk() && listener.changes == 1,
@@ -1024,7 +1024,7 @@ void checkProjectEditNotifications(const juce::File& sample)
 
 void checkCalibrationCapture()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     calibrate(plugin);
     const auto previous = plugin.measuredLevels();
@@ -1105,7 +1105,7 @@ void createSample(const juce::File& file)
 
 void checkSampleHandoff(const juce::File& sample)
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     require(plugin.loadSample(sample).wasOk(), "Could not stage the one-shot");
     const auto startVoice = [&]
@@ -1127,7 +1127,7 @@ void checkSampleHandoff(const juce::File& sample)
 
 void checkWavPitch(const juce::File& sample)
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     require(plugin.loadSample(sample).wasOk(), "Could not load WAV for pitch test");
     setParameter(plugin, "lfoShape", 4.0f);
     setParameter(plugin, "lfoSeconds", 0.08f);
@@ -1160,7 +1160,7 @@ void checkWavTail()
     juce::FloatVectorOperations::fill(fixture.getWritePointer(0), 0.2f, fixture.getNumSamples());
     require(writer->writeFromAudioSampleBuffer(fixture, 0, fixture.getNumSamples()), "Could not write tail fixture");
     writer.reset();
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     require(plugin.loadSample(cleanup.getFile()).wasOk(), "Maximum-length sample did not load");
     setParameter(plugin, "pitchSemitones", -24.0f);
@@ -1202,7 +1202,7 @@ void benchmarkCallbacks()
             for (std::size_t scenario = 0; scenario < scenarios.size(); ++scenario)
                 for (const bool showEditor : { false, true })
                 {
-                    PadTrigger plugin;
+                    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
                     plugin.prepareToPlay(sampleRate, frames);
                     require(plugin.loadSample(sample.getFile()).wasOk(), "Could not load benchmark WAV");
                     setParameter(plugin, "retriggerMs", 8.0f);
@@ -1291,7 +1291,7 @@ void checkBusLayouts()
     for (const int inputs : {1, 2})
         for (const int outputs : {1, 2})
         {
-            PadTrigger plugin;
+            PadTrigger plugin(PadTrigger::InitialSetup::legacy);
             juce::AudioProcessor::BusesLayout layout;
             const auto mono = juce::AudioChannelSet::mono(), stereo = juce::AudioChannelSet::stereo();
             layout.inputBuses.add(inputs == 1 ? mono : stereo);
@@ -1322,9 +1322,122 @@ void checkBusLayouts()
         }
 }
 
-void checkFrontPanel(const juce::File& sample)
+juce::TextButton* panelButton(juce::Component& editor, const juce::String& text)
+{
+    for (auto* child : editor.getChildren())
+        if (auto* button = dynamic_cast<juce::TextButton*>(child); button != nullptr && button->getButtonText() == text)
+            return button;
+    return nullptr;
+}
+
+void checkPhraseWorkflow()
+{
+    using Command = MidiNotes::PhraseCommand;
+    PadTrigger plugin;
+    plugin.prepareToPlay(rate, blockSize);
+    require(plugin.isMidiMode() && plugin.midiNotes.getHarmony().motion == MidiNotes::Motion::wandering,
+            "The default setup was not ready for melodic exploration");
+    setParameter(plugin, "retriggerMs", 8.0f);
+    const auto played = notePitches(playStrokes(plugin, 6));
+    require(played.size() == 6, "Explore dropped a pad stroke");
+    const std::vector<int> kept(played.end() - 4, played.end());
+    const auto recent = plugin.midiNotes.phraseDisplay(0);
+    require(recent.length == 6 && recent.last == 5 && recent.velocities[5] > 0,
+            "Explore did not show its last hit and velocity");
+    plugin.requestAudition();
+    juce::MidiBuffer audition;
+    process(plugin, blockSize, noise, &audition);
+    require(notePitches(audition) == std::vector<int>{60}
+            && plugin.midiNotes.phraseDisplay(0).pitches == recent.pitches,
+            "Audition did not send the fixed note independently");
+    require(plugin.midiNotes.applyPhraseCommand(Command::keep, 4), "Keep could not capture the recent notes");
+    require(plugin.midiNotes.phraseDisplay(0).next == 0, "Repeat did not begin at step one");
+    auto twice = kept;
+    twice.insert(twice.end(), kept.begin(), kept.end());
+    require(notePitches(playStrokes(plugin, 8)) == twice, "Repeat did not play the captured pitches in order");
+    auto& notes = plugin.midiNotes;
+    const auto before = notes.phraseDisplay(0).pitches;
+    require(notes.editPhraseStep(1, std::nullopt), "Vary could not change a retained step");
+    const auto varied = notes.phraseDisplay(0);
+    auto expected = before;
+    expected[1] = varied.pitches[1];
+    require(varied.pitches[1] != before[1] && varied.pitches == expected && varied.canUndo,
+            "Vary changed the wrong steps");
+    require(notes.undoPhraseEdit() && notes.phraseDisplay(0).pitches == before, "Undo did not restore the pitch");
+    auto harmony = notes.getHarmony();
+    --harmony.octave;
+    require(notes.setHarmony(harmony), "The captured phrase could not change register");
+    const auto lower = notes.phraseDisplay(0);
+    for (int i = 0; i < lower.length; ++i)
+        require(lower.pitches[static_cast<std::size_t>(i)] == before[static_cast<std::size_t>(i)] - 12,
+                "Changing register changed the shape of the phrase");
+    juce::MemoryBlock state;
+    plugin.getStateInformation(state);
+    PadTrigger restored;
+    restored.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    restored.prepareToPlay(rate, blockSize);
+    require(restored.midiNotes.phraseDisplay(0).pitches == lower.pitches
+            && restored.midiNotes.getHarmony().octave == harmony.octave, "Saved project lost the phrase or register");
+    setParameter(restored, "explorePhrase", 1.0f);
+    juce::MidiBuffer events;
+    process(restored, blockSize, noise, &events);
+    require(!restored.midiNotes.phraseDisplay(0).repeating, "The Explore controller parameter did not return to live picking");
+    playStrokes(restored, 4);
+    setParameter(restored, "keepPhrase", 1.0f);
+    process(restored, blockSize, noise, &events);
+    require(restored.midiNotes.phraseDisplay(0).repeating, "The Keep controller parameter did not capture hits");
+}
+
+void checkChordAndBeatGate()
 {
     PadTrigger plugin;
+    plugin.prepareToPlay(rate, blockSize);
+    auto harmony = plugin.midiNotes.getHarmony();
+    harmony.follow = true;
+    plugin.midiNotes.setHarmony(harmony);
+    juce::AudioBuffer<float> buffer(2, blockSize);
+    juce::MidiBuffer midi;
+    buffer.clear();
+    midi.addEvent(juce::MidiMessage::noteOn(1, 61, static_cast<juce::uint8>(90)), 0);
+    midi.addEvent(juce::MidiMessage::noteOn(1, 66, static_cast<juce::uint8>(90)), 2);
+    plugin.processBlock(buffer, midi);
+    require(notePitches(midi).empty() && plugin.midiNotes.heldChord() != 0,
+            "Holding a chord generated notes without a stroke");
+    const auto chord = notePitches(playStrokes(plugin, 1));
+    require(chord.size() == 1 && (chord.front() % 12 == 1 || chord.front() % 12 == 6),
+            "Follow chords picked a pitch outside the held MIDI harmony");
+    buffer.clear();
+    midi.clear();
+    midi.addEvent(juce::MidiMessage::allNotesOff(1), 0);
+    plugin.processBlock(buffer, midi);
+    require(plugin.midiNotes.heldChord() == 0, "Releasing the chord did not restore the selected scale");
+
+    struct PlayHead final : juce::AudioPlayHead
+    {
+        PositionInfo position;
+        juce::Optional<PositionInfo> getPosition() const override { return position; }
+    } host;
+    host.position.setBpm(120.0);
+    plugin.setPlayHead(&host);
+    setParameter(plugin, "gateDivision", 4.0f);
+    midi = playStrokes(plugin, 1);
+    int noteOn = -1, noteOff = -1;
+    for (const auto event : midi)
+    {
+        const auto message = event.getMessage();
+        if (message.isNoteOn())
+            noteOn = event.samplePosition;
+        else if (message.isNoteOff())
+            noteOff = event.samplePosition;
+    }
+    require(noteOn >= 0 && noteOff - noteOn == rate / 8,
+            "A sixteenth-note gate at 120 BPM did not release 125 ms after its onset");
+    plugin.setPlayHead(nullptr);
+}
+
+void checkFrontPanel(const juce::File& sample)
+{
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     require(plugin.getName() == "Padomizer", "The host-facing name did not change");
     std::unique_ptr<juce::AudioProcessorEditor> base(plugin.createEditor());
     auto& editor = dynamic_cast<PadEditor&>(*base);
@@ -1336,18 +1449,14 @@ void checkFrontPanel(const juce::File& sample)
             keyboards += self(self, *child);
         return keyboards;
     };
-    require(inspect(inspect, editor) == 1, "The inline keyboard was missing in WAV mode");
-    juce::TextButton* toggle = nullptr;
-    for (auto* child : editor.getChildren())
-        if (auto* button = dynamic_cast<juce::TextButton*>(child); button != nullptr
-            && button->getButtonText() == "Hide note set")
-            toggle = button;
-    require(toggle != nullptr, "The WAV note-set view could not be collapsed");
-    const auto expandedHeight = editor.getHeight();
+    require(inspect(inspect, editor) == 0, "The optional note editor should start collapsed");
+    auto* toggle = panelButton(editor, "Note editor");
+    require(toggle != nullptr, "The note editor button was missing");
+    const auto compactHeight = editor.getHeight();
     toggle->onClick();
-    require(editor.getHeight() < expandedHeight && inspect(inspect, editor) == 0, "The compact WAV view did not collapse");
+    require(editor.getHeight() > compactHeight && inspect(inspect, editor) == 1, "The inline keyboard did not open");
     toggle->onClick();
-    require(editor.getHeight() == expandedHeight && inspect(inspect, editor) == 1, "The inline keyboard could not be reopened");
+    require(editor.getHeight() == compactHeight && inspect(inspect, editor) == 0, "The inline keyboard did not close");
     const juce::StringArray files { sample.getFullPathName() };
     require(editor.isInterestedInFileDrag(files), "The faceplate did not accept an inline WAV drop");
     editor.filesDropped(files, 100, 100);
@@ -1358,8 +1467,11 @@ void checkFrontPanel(const juce::File& sample)
             for (auto* button : component->getChildren())
                 if (button->getTitle() == "Next Sound mode")
                     dynamic_cast<juce::TextButton&>(*button).onClick();
-    require(plugin.isMidiMode() && editor.getLocalBounds() == caseSize && inspect(inspect, editor) == 1,
-            "The mode selector resized the case or hid the inline keyboard");
+    require(plugin.isMidiMode() && editor.getLocalBounds() == caseSize && inspect(inspect, editor) == 0,
+            "The mode selector opened the keyboard or resized the compact case");
+    auto* mod = panelButton(editor, "Modulation");
+    require(mod != nullptr, "Modulation button was missing");
+    mod->onClick();
     juce::Slider* depth = nullptr;
     juce::TextButton* coarse = nullptr;
     juce::TextButton* fine = nullptr;
@@ -1384,7 +1496,7 @@ void checkFrontPanel(const juce::File& sample)
 
 void checkScopeThreshold()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     PadTrigger::Scope scope {};
     const auto signal = [](int frame)
@@ -1418,7 +1530,7 @@ void checkScopeThreshold()
 
 void checkScopeRejectionReasons()
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     PadTrigger::Scope scope {};
     process(plugin, 18000, [](int frame)
@@ -1438,7 +1550,7 @@ void checkScopeRejectionReasons()
 
 void run(const juce::File& sample)
 {
-    PadTrigger plugin;
+    PadTrigger plugin(PadTrigger::InitialSetup::legacy);
     plugin.prepareToPlay(rate, blockSize);
     const auto empty = process(plugin, 4096, [](int frame) { return stroke(frame, 1500, 0.02f); });
     require(empty == std::vector<float>(empty.size(), 0.0f), "Mic audio leaked without a WAV");
@@ -1487,7 +1599,7 @@ void run(const juce::File& sample)
 
     juce::MemoryBlock state;
     plugin.getStateInformation(state);
-    PadTrigger restored;
+    PadTrigger restored(PadTrigger::InitialSetup::legacy);
     restored.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
     restored.prepareToPlay(rate, blockSize);
     require(restored.measuredLevels().hard == levels.hard && restored.sampleDescription() == sample.getFileName(),
@@ -1495,7 +1607,7 @@ void run(const juce::File& sample)
     require(process(restored, 14500, signal) == wet, "Restored project produced different samples");
 
     require(sample.deleteFile(), "Could not remove the fixture WAV");
-    PadTrigger missing;
+    PadTrigger missing(PadTrigger::InitialSetup::legacy);
     missing.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
     require(missing.sampleDescription().startsWith("Missing"), "Missing WAV was not reported");
     createSample(sample);
@@ -1542,6 +1654,8 @@ int main(int argc, char** argv)
         checkWavPitch(sample);
         checkWavTail();
         checkBusLayouts();
+        checkPhraseWorkflow();
+        checkChordAndBeatGate();
         checkFrontPanel(sample);
         checkCalibrationCapture();
         checkCalibrationWithLateAccentPeak();
@@ -1549,7 +1663,7 @@ int main(int argc, char** argv)
         run(sample);
         if (argc == 2)
         {
-            PadTrigger plugin;
+            PadTrigger plugin(PadTrigger::InitialSetup::legacy);
             plugin.prepareToPlay(rate, blockSize);
             require(plugin.loadSample(sample).wasOk(), "Could not load the fixture for the editor");
             calibrate(plugin);
@@ -1576,7 +1690,24 @@ int main(int argc, char** argv)
                 setParameter(plugin, "lfoSemitones", 24.0f);
                 setParameter(plugin, "lfoCents", 25.0f);
             }
+            const auto preview = juce::String(argv[1]);
+            if (preview.containsIgnoreCase("phrase"))
+            {
+                setParameter(plugin, "patternLength", 0.0f);
+                setParameter(plugin, "retriggerMs", 8.0f);
+                auto harmony = plugin.midiNotes.getHarmony();
+                harmony.scale = 1;
+                harmony.motion = MidiNotes::Motion::wandering;
+                plugin.midiNotes.setHarmony(harmony);
+                playStrokes(plugin, 6);
+                plugin.midiNotes.applyPhraseCommand(MidiNotes::PhraseCommand::keep, 4);
+                playStrokes(plugin, 1);
+            }
             const std::unique_ptr<juce::AudioProcessorEditor> editor(plugin.createEditor());
+            for (const auto* name : {"Input setup", "Modulation", "Note editor"})
+                if (preview.containsIgnoreCase(juce::String(name).upToFirstOccurrenceOf(" ", false, false)))
+                    if (auto* button = panelButton(*editor, name))
+                        button->onClick();
             const auto image = editor->createComponentSnapshot(editor->getLocalBounds());
             const auto target = juce::File::getCurrentWorkingDirectory().getChildFile(argv[1]);
             auto stream = target.createOutputStream();

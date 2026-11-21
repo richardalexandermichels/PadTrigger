@@ -43,7 +43,8 @@ public:
     static constexpr int calibrationSeconds = 15;
     using Scope = std::array<ScopeFrame, scopeSize>;
 
-    PadTrigger();
+    enum class InitialSetup { melodic, legacy };
+    explicit PadTrigger(InitialSetup = InitialSetup::melodic);
     ~PadTrigger() override;
     void prepareToPlay(double sampleRate, int maxBlockSize) override;
     void releaseResources() override;
@@ -81,6 +82,8 @@ public:
     int notesPerSecond() const { return noteRate.load(std::memory_order_relaxed); }
     int livePatternLength() const { return shownPatternLength.load(std::memory_order_relaxed); }
     int livePatternStep() const { return shownPatternStep.load(std::memory_order_relaxed); }
+    void requestAudition() { auditionRequested.store(true); }
+    unsigned detectedHits() const { return hitCount.load(std::memory_order_relaxed); }
     float lfoPosition() const { return shownLfoPhase.load(std::memory_order_relaxed); }
     float getLfoDepth(Lfo::Knob knob) const { return lfoDepth[knob]->load(std::memory_order_relaxed); }
     void setPoolLearn(PoolLearn source);
@@ -104,7 +107,7 @@ private:
         float gain = 0.0f;
     };
 
-    static juce::AudioProcessorValueTreeState::ParameterLayout createParameters();
+    static juce::AudioProcessorValueTreeState::ParameterLayout createParameters(InitialSetup);
     static std::uint32_t packLevels(Levels);
     static Levels unpackLevels(std::uint32_t);
     float sensitivityThresholdDb(Levels, float sensitivityDb) const;
@@ -135,6 +138,15 @@ private:
     std::atomic<float>* const lfoClock;
     std::atomic<float>* const lfoSeconds;
     std::atomic<float>* const lfoDivision;
+    std::atomic<float>* const captureLength;
+    std::atomic<float>* const keepPedal;
+    std::atomic<float>* const explorePedal;
+    std::atomic<float>* const gateDivision;
+    std::atomic<float>* const degreePitch;
+    std::atomic<float>* const monoMidi;
+    bool keepWasDown = false, exploreWasDown = false;
+    std::atomic<bool> auditionRequested { false };
+    std::atomic<unsigned> hitCount { 0 };
     juce::SpinLock midiRestoreLock;
     std::array<std::atomic<float>*, Lfo::targetCount> lfoDepth {};
     double lfoPhase = 0.0, lfoBpm = 120.0, lfoBarBeats = 4.0;

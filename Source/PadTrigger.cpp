@@ -33,10 +33,10 @@ float decodeScope(std::uint64_t bits)
 }
 }
 
-PadTrigger::PadTrigger()
+PadTrigger::PadTrigger(InitialSetup setup)
     : AudioProcessor(BusesProperties().withInput("Mic", juce::AudioChannelSet::stereo(), true)
                                       .withOutput("Out", juce::AudioChannelSet::stereo(), true)),
-      settings(*this, nullptr, "PadTrigger", createParameters()),
+      settings(*this, nullptr, "PadTrigger", createParameters(setup)),
       sensitivity(settings.getRawParameterValue("sensitivity")),
       dynamics(settings.getRawParameterValue("dynamics")),
       sampleGain(settings.getRawParameterValue("sampleGain")),
@@ -51,10 +51,19 @@ PadTrigger::PadTrigger()
       lfoShape(settings.getRawParameterValue("lfoShape")),
       lfoClock(settings.getRawParameterValue("lfoClock")),
       lfoSeconds(settings.getRawParameterValue("lfoSeconds")),
-      lfoDivision(settings.getRawParameterValue("lfoDivision"))
+      lfoDivision(settings.getRawParameterValue("lfoDivision")),
+      captureLength(settings.getRawParameterValue("phraseCaptureLength")),
+      keepPedal(settings.getRawParameterValue("keepPhrase")),
+      explorePedal(settings.getRawParameterValue("explorePhrase")),
+      gateDivision(settings.getRawParameterValue("gateDivision")),
+      degreePitch(settings.getRawParameterValue("degreePitch")),
+      monoMidi(settings.getRawParameterValue("monoMidi"))
 {
     for (std::size_t i = 0; i < lfoDepth.size(); ++i)
         lfoDepth[i] = settings.getRawParameterValue(Lfo::targets[i].depth);
+    if (setup == InitialSetup::melodic)
+        midiNotes.setHarmony({ 0, 1, 4, MidiNotes::Motion::wandering, false });
+    startTimerHz(10);
 }
 
 PadTrigger::~PadTrigger()
@@ -67,10 +76,11 @@ void PadTrigger::notifyStateEdited()
     updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}.withNonParameterStateChanged(true));
 }
 
-juce::AudioProcessorValueTreeState::ParameterLayout PadTrigger::createParameters()
+juce::AudioProcessorValueTreeState::ParameterLayout PadTrigger::createParameters(InitialSetup setup)
 {
     using namespace juce;
     AudioProcessorValueTreeState::ParameterLayout layout;
+    const bool melodic = setup == InitialSetup::melodic;
     const auto decibels = AudioParameterFloatAttributes().withLabel("dB");
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"sensitivity", 1}, "Trigger sensitivity",
                    NormalisableRange<float>{-12.0f, 12.0f, 0.5f}, 0.0f, decibels),
@@ -79,15 +89,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout PadTrigger::createParameters
                std::make_unique<AudioParameterFloat>(ParameterID{"sampleGain", 1}, "Output level",
                    NormalisableRange<float>{-48.0f, 6.0f, 0.5f}, -6.0f, decibels),
                std::make_unique<AudioParameterChoice>(ParameterID{"soundMode", 1}, "Sound mode",
-                   StringArray{"WAV Sample", "MIDI Notes"}, 0),
+                   StringArray{"WAV Sample", "MIDI Notes"}, melodic ? 1 : 0),
                std::make_unique<AudioParameterInt>(ParameterID{"patternLength", 1}, "Pattern length",
                    0, MidiNotes::maxPatternLength, 0),
                std::make_unique<AudioParameterInt>(ParameterID{"noteLengthMs", 1}, "Note length",
-                   10, 1000, 140, AudioParameterIntAttributes().withLabel("ms")),
+                   10, 1000, melodic ? 90 : 140, AudioParameterIntAttributes().withLabel("ms")),
                std::make_unique<AudioParameterInt>(ParameterID{"retriggerMs", 1}, "Retrigger",
                    minRetriggerMs, 120, 50, AudioParameterIntAttributes().withLabel("ms")),
                std::make_unique<AudioParameterInt>(ParameterID{"velocityFloor", 1}, "Velocity floor",
-                   1, 127, 72),
+                   1, 127, melodic ? 48 : 72),
                std::make_unique<AudioParameterInt>(ParameterID{"pitchSemitones", 1}, "Semitones",
                    -24, 24, 0, AudioParameterIntAttributes().withLabel("st")),
                std::make_unique<AudioParameterInt>(ParameterID{"pitchCents", 1}, "Cents",
@@ -113,6 +123,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout PadTrigger::createParameters
             AudioParameterFloatAttributes().withLabel(units.trim()).withStringFromValueFunction(
                 [units](float amount, int) { return String(roundToInt(amount)) + units; })));
     }
+    layout.add(std::make_unique<AudioParameterInt>(ParameterID{"phraseCaptureLength", 1}, "Keep last hits", 1, 8, 4),
+               std::make_unique<AudioParameterBool>(ParameterID{"keepPhrase", 1}, "Keep Phrase", false),
+               std::make_unique<AudioParameterBool>(ParameterID{"explorePhrase", 1}, "Explore Phrase", false),
+               std::make_unique<AudioParameterChoice>(ParameterID{"gateDivision", 1}, "Note length unit", Lfo::gateNames, 0),
+               std::make_unique<AudioParameterChoice>(ParameterID{"degreePitch", 1}, "MIDI pitch unit", StringArray{"Semitones", "Scale degrees"}, 0),
+               std::make_unique<AudioParameterBool>(ParameterID{"monoMidi", 1}, "Mono MIDI", false));
     return layout;
 }
 
@@ -148,6 +164,9 @@ void PadTrigger::prepareToPlay(double sampleRate, int)
     lfoPhase = 0.0;
     lfoBpm = 120.0;
     lfoBarBeats = 4.0;
+    keepWasDown = keepPedal->load() > 0.5f;
+    exploreWasDown = explorePedal->load() > 0.5f;
+    midiNotes.clearChord();
     shownSensitivity.store(sensitivity->load(), std::memory_order_relaxed);
     shownPatternLength.store(static_cast<int>(patternLength->load()), std::memory_order_relaxed);
     shownPatternStep.store(-1, std::memory_order_relaxed);
@@ -170,12 +189,36 @@ void PadTrigger::releaseResources()
 void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
     juce::ScopedNoDenormals noDenormals;
-    if (learningPool.load(std::memory_order_acquire) == PoolLearn::track)
-        for (const auto event : midi)
+    struct ChordEvent { int frame, channel, pitch; bool down; };
+    std::array<ChordEvent, 256> chordEvents;
+    std::size_t chordCount = 0, chordIndex = 0;
+    const auto learn = learningPool.load(std::memory_order_acquire);
+    for (const auto event : midi)
+    {
+        if (event.numBytes != 3)
+            continue;
+        const auto type = event.data[0] & 0xf0;
+        const auto pitch = event.data[1] & 0x7f;
+        const bool down = type == 0x90 && event.data[2] != 0;
+        if (learn == PoolLearn::track && down)
+            learnPoolPitch(pitch, PoolLearn::track);
+        if (learn != PoolLearn::off)
+            continue;
+        const bool allOff = type == 0xb0 && (pitch == 120 || pitch == 123);
+        if (type == 0x80 || type == 0x90 || allOff)
         {
-            if (event.numBytes == 3 && (event.data[0] & 0xf0) == 0x90 && event.data[2] != 0)
-                learnPoolPitch(event.data[1] & 0x7f, PoolLearn::track);
+            if (chordCount == chordEvents.size())
+            {
+                midiNotes.clearChord();
+                chordCount = 0;
+                break;
+            }
+            chordEvents[chordCount++] = { event.samplePosition, (event.data[0] & 0x0f) + 1,
+                                         allOff ? -1 : pitch, down };
         }
+    }
+    if (learn != PoolLearn::off && midiNotes.heldChord() != 0)
+        midiNotes.clearChord();
     midi.clear();
     if (buffer.getNumSamples() == 0)
         return;
@@ -205,11 +248,21 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
     const auto fullVelocityPeak = toGain(dynamicsFloor + dynamicsRange);
     const auto midiMode = isMidiMode();
     const auto midiPlaying = midiMode && !mutedForCalibration;
+    const auto keepDown = keepPedal->load() > 0.5f;
+    const auto exploreDown = explorePedal->load() > 0.5f;
+    using Command = MidiNotes::PhraseCommand;
+    auto command = Command::none;
+    if (midiPlaying && exploreDown && !exploreWasDown)
+        command = Command::explore;
+    else if (midiPlaying && keepDown && !keepWasDown)
+        command = Command::keep;
+    keepWasDown = keepDown;
+    exploreWasDown = exploreDown;
     const auto baseLength = [&]
     {
         const juce::SpinLock::ScopedTryLockType lock(midiRestoreLock);
         const auto length = lock.isLocked() ? std::optional{juce::roundToInt(patternLength->load())} : std::nullopt;
-        return midiNotes.beginBlock(midi, midiPlaying, length);
+        return midiNotes.beginBlock(midi, midiPlaying, length, command, static_cast<int>(captureLength->load()));
     }();
     const std::array<float, Lfo::knobCount> base {{
         sensitivity->load(), dynamics->load(), sampleGain->load(), static_cast<float>(baseLength),
@@ -220,39 +273,48 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
         depth[i] = lfoDepth[i]->load(std::memory_order_relaxed);
     const auto shape = static_cast<int>(lfoShape->load());
     auto phaseStep = 1.0 / (rate * lfoSeconds->load());
-    if (lfoClock->load() > 0.5f)
+    const bool tempoLfo = lfoClock->load() > 0.5f;
+    const auto gateIndex = midiMode ? static_cast<std::size_t>(gateDivision->load()) : 0;
+    if (tempoLfo || gateIndex != 0)
     {
         const auto* head = getPlayHead();
         const auto position = head != nullptr ? head->getPosition() : juce::Optional<juce::AudioPlayHead::PositionInfo>{};
         if (position)
         {
-            if (const auto bpm = position->getBpm(); bpm && std::isfinite(*bpm) && *bpm > 0.0)
+            if (const auto bpm = position->getBpm(); bpm && std::isfinite(*bpm) && *bpm >= 1.0)
                 lfoBpm = *bpm;
             if (const auto signature = position->getTimeSignature(); signature && signature->numerator > 0 && signature->denominator > 0)
                 lfoBarBeats = 4.0 * signature->numerator / signature->denominator;
         }
-        const auto division = static_cast<int>(lfoDivision->load());
-        const auto beats = division < 4 ? (4 - division) * lfoBarBeats
-                                        : Lfo::divisions[static_cast<std::size_t>(division)].quarterNotes;
-        phaseStep = lfoBpm / (60.0 * rate * beats);
-        if (position && position->getIsPlaying())
-            if (const auto ppq = position->getPpqPosition(); ppq && std::isfinite(*ppq))
-            {
-                auto cycles = *ppq / beats;
-                const auto barStart = position->getPpqPositionOfLastBarStart();
-                const auto barIndex = position->getBarCount();
-                if (division < 4 && barStart && std::isfinite(*barStart) && (division == 3 || barIndex))
+        if (tempoLfo)
+        {
+            const auto division = static_cast<int>(lfoDivision->load());
+            const auto beats = division < 4 ? (4 - division) * lfoBarBeats
+                                            : Lfo::divisions[static_cast<std::size_t>(division)].quarterNotes;
+            phaseStep = lfoBpm / (60.0 * rate * beats);
+            if (position && position->getIsPlaying())
+                if (const auto ppq = position->getPpqPosition(); ppq && std::isfinite(*ppq))
                 {
-                    const auto barsPerCycle = 4 - division;
-                    const auto bars = barIndex ? *barIndex % barsPerCycle : 0;
-                    cycles = (static_cast<double>(bars) + (*ppq - *barStart) / lfoBarBeats) / barsPerCycle;
+                    auto cycles = *ppq / beats;
+                    const auto barStart = position->getPpqPositionOfLastBarStart();
+                    const auto barIndex = position->getBarCount();
+                    if (division < 4 && barStart && std::isfinite(*barStart) && (division == 3 || barIndex))
+                    {
+                        const auto barsPerCycle = 4 - division;
+                        const auto bars = barIndex ? *barIndex % barsPerCycle : 0;
+                        cycles = (static_cast<double>(bars) + (*ppq - *barStart) / lfoBarBeats) / barsPerCycle;
+                    }
+                    lfoPhase = Lfo::wrap(cycles);
                 }
-                lfoPhase = Lfo::wrap(cycles);
-            }
+        }
     }
     const auto phaseAt = [&](int frame) { return lfoPhase + phaseStep * frame; };
     const auto modulate = [&](Lfo::Knob knob, float signal) { return Lfo::apply(knob, base[knob], depth[knob], signal); };
     const auto samplesFromMs = [this](float ms) { return juce::jmax(1, juce::roundToInt(rate * ms / 1000.0)); };
+    const auto beatDurationMs = gateIndex == 0 ? 0.0f
+        : static_cast<float>(60000.0 * Lfo::gateBeats[gateIndex] / lfoBpm);
+    const auto inDegrees = degreePitch->load() > 0.5f;
+    const auto monophonic = monoMidi->load() > 0.5f;
     const auto holdFrames = samplesFromMs(base[Lfo::retrigger]);
 
     // A pending replacement is a short hand-off. A busy publisher never interrupts the current WAV.
@@ -328,11 +390,21 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
         updateContinuous(-previousStep);
     if (midiPlaying && !bendModulated && (!bendEnabled || midiNotes.hasActiveNotes()))
         midiNotes.setFinePitch(midi, 0, base[Lfo::cents], midiBendRange);
+    if (auditionRequested.exchange(false) && midiPlaying)
+        midiNotes.audition(midi, samplesFromMs(150.0f));
     auto nextBendFrame = bendModulated
         ? static_cast<int>((midiBendInterval - audioFrame % midiBendInterval) % midiBendInterval) : 0;
 
     for (int frame = 0; frame < frames; ++frame)
     {
+        while (chordIndex < chordCount && chordEvents[chordIndex].frame <= frame)
+        {
+            const auto event = chordEvents[chordIndex++];
+            if (event.pitch < 0)
+                midiNotes.clearChord(event.channel);
+            else
+                midiNotes.chordNote(event.channel, event.pitch, event.down);
+        }
         if (updateContinuousControls && frame > 0 && (previousStep + frame) % controlStep == 0)
             updateContinuous(frame);
         if (midiMode)
@@ -379,6 +451,8 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
             if (detected.onset && depth[Lfo::retrigger] > 0.0f)
                 detector.holdOff(samplesFromMs(modulate(Lfo::retrigger, Lfo::wave(shape, phaseAt(frame)))));
             hit = detected.peak > 0.0f;
+            if (hit)
+                hitCount.fetch_add(1, std::memory_order_relaxed);
             rejection = detected.rejection;
             if (hit && (midiMode || canPlay))
             {
@@ -393,12 +467,14 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
                 {
                     const auto minimumVelocity = modulate(Lfo::velocity, signal);
                     const auto velocity = minimumVelocity + (127.0f - minimumVelocity) * response;
-                    const auto length = juce::roundToInt(modulate(Lfo::pattern, signal));
-                    const auto duration = samplesFromMs(modulate(Lfo::noteLength, signal));
+                    const auto length = midiNotes.constrainedLength(juce::roundToInt(modulate(Lfo::pattern, signal)));
+                    const auto modulatedMs = modulate(Lfo::noteLength, signal);
+                    const auto duration = samplesFromMs(beatDurationMs == 0.0f ? modulatedMs
+                        : beatDurationMs * modulatedMs / base[Lfo::noteLength]);
                     const auto transpose = juce::roundToInt(modulate(Lfo::semitones, signal));
                     const auto step = Lfo::patternStep(length, positionDepth, signal);
                     midiNotes.trigger(midi, frame, juce::roundToInt(velocity), length, duration,
-                                      transpose, step, modulate(Lfo::cents, signal), midiBendRange);
+                                      transpose, step, modulate(Lfo::cents, signal), midiBendRange, inDegrees, monophonic);
                 }
                 else
                 {
@@ -438,7 +514,8 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
     shownSensitivity.store(sensitivityDb, std::memory_order_relaxed);
     const auto lengthModulated = baseLength > 0 && depth[Lfo::pattern] > 0.0f;
     const auto displaySignal = lengthModulated || positionDepth > 0.0f ? Lfo::wave(shape, lfoPhase) : 0.0f;
-    const auto displayedLength = lengthModulated ? juce::roundToInt(modulate(Lfo::pattern, displaySignal)) : baseLength;
+    const auto displayedLength = midiNotes.constrainedLength(lengthModulated
+        ? juce::roundToInt(modulate(Lfo::pattern, displaySignal)) : baseLength);
     shownPatternLength.store(displayedLength, std::memory_order_relaxed);
     shownPatternStep.store(Lfo::patternStep(displayedLength, positionDepth, displaySignal), std::memory_order_relaxed);
 }
@@ -564,8 +641,7 @@ void PadTrigger::advanceCalibration()
         default:
             return;
     }
-    if (calibration.compare_exchange_strong(stage, next) && next == CalibrationStage::startHard)
-        startTimerHz(10);
+    calibration.compare_exchange_strong(stage, next);
 }
 
 void PadTrigger::cancelCalibration()
@@ -715,12 +791,8 @@ void PadTrigger::finishCalibration(CalibrationStage stage)
 
 void PadTrigger::timerCallback()
 {
-    const auto stage = calibration.load();
-    if (stage != CalibrationStage::startHard && stage != CalibrationStage::hard
-        && stage != CalibrationStage::committing)
-        stopTimer();
-
-    if (calibrationEdited.exchange(false))
+    const auto phraseEdited = midiNotes.takeHostEdit();
+    if (calibrationEdited.exchange(false) || phraseEdited)
         notifyStateEdited();
 }
 
@@ -914,20 +986,30 @@ void PadTrigger::setStateInformation(const void* data, int size)
         state.removeChild(notesState, nullptr);
     if (const auto legacyAuto = state.getChildWithProperty("id", "autoRetrigger"); legacyAuto.isValid())
         state.removeChild(legacyAuto, nullptr);
-    const auto restoreDefault = [this, &state](const char* id)
+    const auto restoreDefault = [this, &state](const char* id, std::optional<float> legacy = std::nullopt)
     {
         if (!state.getChildWithProperty("id", id).isValid())
         {
             juce::ValueTree parameter("PARAM");
             parameter.setProperty("id", id, nullptr);
             const auto* setting = settings.getParameter(id);
-            parameter.setProperty("value", setting->convertFrom0to1(setting->getDefaultValue()), nullptr);
+            parameter.setProperty("value", legacy.value_or(setting->convertFrom0to1(setting->getDefaultValue())), nullptr);
             state.appendChild(parameter, nullptr);
         }
     };
-    for (const auto* id : { "soundMode", "patternLength", "noteLengthMs", "retriggerMs", "velocityFloor",
-                           "pitchSemitones", "pitchCents", "bendRange", "lfoShape", "lfoClock", "lfoSeconds", "lfoDivision" })
+    restoreDefault("soundMode", 0.0f);
+    restoreDefault("noteLengthMs", 140.0f);
+    restoreDefault("velocityFloor", 72.0f);
+    for (const auto* id : { "patternLength", "retriggerMs",
+                           "pitchSemitones", "pitchCents", "bendRange", "lfoShape", "lfoClock", "lfoSeconds", "lfoDivision",
+                           "phraseCaptureLength", "gateDivision", "degreePitch", "monoMidi" })
         restoreDefault(id);
+    for (const auto* id : { "keepPhrase", "explorePhrase" })
+    {
+        if (const auto pedal = state.getChildWithProperty("id", id); pedal.isValid())
+            state.removeChild(pedal, nullptr);
+        restoreDefault(id);
+    }
     for (const auto& target : Lfo::targets)
         restoreDefault(target.depth);
     const juce::SpinLock::ScopedLockType lock(midiRestoreLock);

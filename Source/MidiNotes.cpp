@@ -1,11 +1,28 @@
 #include "MidiNotes.h"
 #include <algorithm>
+#include <tuple>
 #include <utility>
 
 namespace
 {
 constexpr auto stateType = "MidiNotes";
 constexpr auto poolType = "Pool";
+constexpr std::array<const char*, 10> scales {{
+    "Note set", "Major Pentatonic", "Minor Pentatonic", "Major", "Minor", "Dorian", "Mixolydian",
+    "Root + Fifth", "Major Triad", "Minor Triad"
+}};
+constexpr std::array<unsigned, scales.size()> scaleMasks {{
+    0u, 0x295u, 0x4a9u, 0xab5u, 0x5adu, 0x6adu, 0x6b5u, 0x081u, 0x091u, 0x089u
+}};
+
+void addScaleState(juce::ValueTree& state, const MidiNotes::Harmony& harmony)
+{
+    state.setProperty("key", harmony.key, nullptr);
+    state.setProperty("scale", harmony.scale, nullptr);
+    state.setProperty("octave", harmony.octave, nullptr);
+    state.setProperty("motion", static_cast<int>(harmony.motion), nullptr);
+    state.setProperty("followChords", harmony.follow, nullptr);
+}
 
 int parsePitch(const juce::String& token)
 {
@@ -41,6 +58,60 @@ MidiNotes::MidiNotes()
 {
     noteOffs.fill(noDeadline);
     publishPool(Pattern{});
+}
+
+void MidiNotes::History::push(int pitch, int output, int velocity)
+{
+    const auto at = static_cast<std::size_t>(next);
+    pitches[at] = pitch;
+    sounded[at] = output;
+    velocities[at] = velocity;
+    next = (next + 1) % historySize;
+    count = juce::jmin(historySize, count + 1);
+}
+
+juce::StringArray MidiNotes::scaleNames()
+{
+    juce::StringArray result;
+    for (const auto* name : scales)
+        result.add(name);
+    return result;
+}
+
+MidiNotes::Harmony MidiNotes::getHarmony() const
+{
+    const juce::ScopedLock lock(poolLock);
+    return harmony;
+}
+
+bool MidiNotes::setHarmony(Harmony next)
+{
+    next.key = juce::jlimit(0, 11, next.key);
+    next.scale = juce::jlimit(0, static_cast<int>(scales.size()) - 1, next.scale);
+    next.octave = juce::jlimit(-1, 8, next.octave);
+    const juce::ScopedLock lock(poolLock);
+    if (std::tie(next.key, next.scale, next.octave, next.motion, next.follow)
+        == std::tie(harmony.key, harmony.scale, harmony.octave, harmony.motion, harmony.follow))
+        return false;
+
+    const auto shift = next.key - harmony.key + 12 * (next.octave - harmony.octave);
+    const bool changesScale = next.scale != harmony.scale;
+    harmony = next;
+    if (changesScale || shift != 0)
+    {
+        if (changesScale)
+            poolEdits.reset();
+        else if (poolEdits)
+            *poolEdits = shift > 0 ? *poolEdits << shift : *poolEdits >> -shift;
+        publishPool(std::nullopt, true, shift);
+    }
+    else
+    {
+        const juce::SpinLock::ScopedLockType guard(patternLock);
+        sharedHarmony = harmony;
+        ++revision;
+    }
+    return true;
 }
 
 MidiNotes::Notes MidiNotes::parsePitches(const juce::String& text)
@@ -112,11 +183,14 @@ bool MidiNotes::selectPool(int index)
 {
     const juce::ScopedLock lock(poolLock);
     const auto count = static_cast<int>(factoryPools().size() + customPools.size());
-    if (!juce::isPositiveAndBelow(index, count) || index == selected)
+    if (!juce::isPositiveAndBelow(index, count) || (index == selected && harmony.scale == 0))
         return false;
     selected = index;
+    harmony.scale = 0;
+    harmony.key = 0;
+    harmony.octave = 4;
     poolEdits.reset();
-    publishPool(Pattern{});
+    publishPool(Pattern{}, true);
     return true;
 }
 
@@ -125,8 +199,9 @@ MidiNotes::PoolDetails MidiNotes::selectedPoolDetails() const
     const juce::ScopedLock lock(poolLock);
     const auto& pool = poolAt(selected);
     const bool custom = selected >= static_cast<int>(factoryPools().size());
-    return { custom ? pool.name : juce::String(),
-             {pool.notes.pitches.begin(), pool.notes.pitches.begin() + pool.notes.size}, poolEdits };
+    const auto unedited = basePoolNotes();
+    return { custom && harmony.scale == 0 ? pool.name : juce::String(),
+             {unedited.pitches.begin(), unedited.pitches.begin() + unedited.size}, poolEdits };
 }
 
 bool MidiNotes::setPoolEdits(std::optional<std::bitset<128>> edits)
@@ -135,7 +210,7 @@ bool MidiNotes::setPoolEdits(std::optional<std::bitset<128>> edits)
     if (poolEdits == edits)
         return false;
     poolEdits = edits;
-    publishPool(std::nullopt);
+    publishPool(std::nullopt, true);
     return true;
 }
 
@@ -163,18 +238,27 @@ juce::Result MidiNotes::savePool(juce::String name, juce::String pitches)
         customPools.push_back({ std::move(name), parsed });
     else
         *existing = { std::move(name), parsed };
+    const auto wasTransformed = harmony.scale > 0 || harmony.key != 0 || harmony.octave != 4;
+    harmony.scale = 0;
+    harmony.key = 0;
+    harmony.octave = 4;
     poolEdits.reset();
     if (unchanged)
-        poolChange.fetch_add(1, std::memory_order_relaxed);
+    {
+        if (wasTransformed)
+            publishPool(std::nullopt);
+        else
+            poolChange.fetch_add(1, std::memory_order_relaxed);
+    }
     else
-        publishPool(Pattern{});
+        publishPool(Pattern{}, true);
     return juce::Result::ok();
 }
 
 MidiNotes::Notes MidiNotes::activePoolNotes() const
 {
     if (!poolEdits)
-        return poolAt(selected).notes;
+        return basePoolNotes();
     Notes active;
     for (std::size_t pitch = 0; pitch < poolEdits->size(); ++pitch)
         if (poolEdits->test(pitch))
@@ -182,7 +266,30 @@ MidiNotes::Notes MidiNotes::activePoolNotes() const
     return active;
 }
 
-void MidiNotes::publishPool(std::optional<Pattern> replacement)
+MidiNotes::Notes MidiNotes::basePoolNotes() const
+{
+    Notes active;
+    if (harmony.scale == 0)
+    {
+        const auto& saved = poolAt(selected).notes;
+        const auto shift = harmony.key + (harmony.octave - 4) * 12;
+        for (int i = 0; i < saved.size; ++i)
+        {
+            const auto pitch = saved.pitches[static_cast<std::size_t>(i)] + shift;
+            if (juce::isPositiveAndBelow(pitch, 128))
+                active.pitches[static_cast<std::size_t>(active.size++)] = pitch;
+        }
+        return active;
+    }
+    const auto root = (harmony.octave + 1) * 12 + harmony.key;
+    const auto mask = scaleMasks[static_cast<std::size_t>(harmony.scale)];
+    for (int degree = 0; degree < 12 && root + degree <= 127; ++degree)
+        if ((mask & (1u << degree)) != 0)
+            active.pitches[static_cast<std::size_t>(active.size++)] = root + degree;
+    return active;
+}
+
+void MidiNotes::publishPool(std::optional<Pattern> replacement, bool clearHistory, std::optional<int> rootShift)
 {
     const auto active = activePoolNotes();
     std::bitset<128> allowed;
@@ -191,13 +298,25 @@ void MidiNotes::publishPool(std::optional<Pattern> replacement)
             allowed.set(static_cast<std::size_t>(active.pitches[static_cast<std::size_t>(i)]));
     const juce::SpinLock::ScopedLockType lock(patternLock);
     sharedNotes = active;
+    sharedHarmony = harmony;
     if (replacement)
         sharedPattern = *replacement;
     else
         for (auto& pitch : sharedPattern.pitches)
-            if (pitch != Pattern::empty && !allowed.test(static_cast<std::size_t>(pitch)))
-                pitch = Pattern::empty;
+            if (pitch != Pattern::empty)
+                pitch = rootShift && active.size > 0 ? nearestPitch(active, pitch + *rootShift)
+                    : (allowed.test(static_cast<std::size_t>(pitch)) ? pitch : Pattern::empty);
+    if (clearHistory)
+    {
+        sharedHistory = {};
+        ++historyRevision;
+    }
+    editUndo.reset();
+    sharedVelocities.fill(0);
+    sharedLast = -1;
+    sharedNext = 0;
     ++revision;
+    ++phraseRestart;
     poolChange.fetch_add(1, std::memory_order_relaxed);
     lastNote.store(0, std::memory_order_relaxed);
 }
@@ -206,8 +325,124 @@ void MidiNotes::resetPattern()
 {
     const juce::SpinLock::ScopedLockType lock(patternLock);
     sharedPattern = {};
+    editUndo.reset();
     ++revision;
+    ++phraseRestart;
     lastNote.store(0, std::memory_order_relaxed);
+}
+
+MidiNotes::PhraseDisplay MidiNotes::phraseDisplay(int length) const
+{
+    const juce::SpinLock::ScopedLockType lock(patternLock);
+    PhraseDisplay display;
+    display.pitches.fill(Pattern::empty);
+    display.historyCount = sharedHistory.count;
+    display.repeating = sharedPattern.mode == Pattern::kept
+        || (sharedPattern.mode == Pattern::automatic && length > 0);
+    display.canUndo = editUndo.has_value();
+    if (display.repeating)
+    {
+        display.length = sharedPattern.mode == Pattern::kept ? sharedPattern.length
+            : juce::jlimit(0, maxPatternLength, length);
+        display.pitches = sharedPattern.pitches;
+        display.velocities = sharedVelocities;
+        display.last = sharedLast;
+        display.next = sharedNext % juce::jmax(1, display.length);
+        const auto end = display.pitches.begin() + display.length;
+        const auto blank = std::find(display.pitches.begin(), end, Pattern::empty);
+        if (blank != end)
+            display.next = static_cast<int>(blank - display.pitches.begin());
+    }
+    else
+    {
+        display.length = sharedHistory.count;
+        display.last = sharedHistory.count - 1;
+        for (int i = 0; i < sharedHistory.count; ++i)
+        {
+            const auto from = static_cast<std::size_t>(sharedHistory.index(i));
+            display.pitches[static_cast<std::size_t>(i)] = sharedHistory.sounded[from];
+            display.velocities[static_cast<std::size_t>(i)] = sharedHistory.velocities[from];
+        }
+    }
+    return display;
+}
+
+bool MidiNotes::changePhrase(PhraseCommand command, int count, const History& source)
+{
+    count = juce::jlimit(1, historySize, count);
+    if (command == PhraseCommand::none || (command == PhraseCommand::keep && source.count < count))
+        return false;
+    if (command == PhraseCommand::explore && sharedPattern.mode == Pattern::explore)
+        return false;
+
+    sharedPattern = {};
+    sharedVelocities.fill(0);
+    sharedPattern.mode = command == PhraseCommand::keep ? Pattern::kept : Pattern::explore;
+    if (command == PhraseCommand::keep)
+    {
+        sharedPattern.length = count;
+        for (int i = 0; i < count; ++i)
+        {
+            const auto from = static_cast<std::size_t>(source.index(source.count - count + i));
+            sharedPattern.pitches[static_cast<std::size_t>(i)] = source.pitches[from];
+            sharedVelocities[static_cast<std::size_t>(i)] = source.velocities[from];
+        }
+    }
+    sharedLast = -1;
+    sharedNext = 0;
+    editUndo.reset();
+    ++revision;
+    ++phraseRestart;
+    return true;
+}
+
+bool MidiNotes::applyPhraseCommand(PhraseCommand command, int count)
+{
+    const juce::SpinLock::ScopedLockType lock(patternLock);
+    return changePhrase(command, count, sharedHistory);
+}
+
+bool MidiNotes::editPhraseStep(int step, std::optional<int> pitch)
+{
+    const juce::SpinLock::ScopedLockType lock(patternLock);
+    if (!juce::isPositiveAndBelow(step, sharedPattern.length) || sharedPattern.mode == Pattern::explore)
+        return false;
+    auto& current = sharedPattern.pitches[static_cast<std::size_t>(step)];
+    if (!pitch)
+    {
+        int total = 0;
+        for (int i = 0; i < sharedNotes.size; ++i)
+        {
+            const auto other = sharedNotes.pitches[static_cast<std::size_t>(i)];
+            if (other != current)
+            {
+                const auto weight = juce::jmax(1, 16 / (1 + std::abs(other - current)));
+                total += weight;
+                if (variation.nextInt(total) < weight)
+                    pitch = other;
+            }
+        }
+    }
+    if (!pitch || *pitch == current || !juce::isPositiveAndBelow(*pitch, 128))
+        return false;
+    if (std::find(sharedNotes.pitches.begin(), sharedNotes.pitches.begin() + sharedNotes.size, *pitch)
+        == sharedNotes.pitches.begin() + sharedNotes.size)
+        return false;
+    editUndo = StepEdit { step, current };
+    current = *pitch;
+    ++revision;
+    return true;
+}
+
+bool MidiNotes::undoPhraseEdit()
+{
+    const juce::SpinLock::ScopedLockType lock(patternLock);
+    if (!editUndo)
+        return false;
+    sharedPattern.pitches[static_cast<std::size_t>(editUndo->step)] = editUndo->pitch;
+    editUndo.reset();
+    ++revision;
+    return true;
 }
 
 juce::String MidiNotes::patternDescription(int length) const
@@ -243,6 +478,7 @@ juce::ValueTree MidiNotes::saveState() const
     juce::ValueTree state(stateType);
     const juce::ScopedLock lock(poolLock);
     state.setProperty("selected", selected, nullptr);
+    addScaleState(state, harmony);
     if (poolEdits)
     {
         const auto active = activePoolNotes();
@@ -267,6 +503,7 @@ juce::ValueTree MidiNotes::saveState() const
     for (auto slot = copy.pitches.begin(); slot != end; ++slot)
         pitches.add(*slot == Pattern::empty ? "-" : juce::String(*slot));
     state.setProperty("patternLength", copy.length, nullptr);
+    state.setProperty("phraseMode", static_cast<int>(copy.mode), nullptr);
     state.setProperty("pattern", pitches.joinIntoString(" "), nullptr);
     return state;
 }
@@ -287,6 +524,11 @@ void MidiNotes::restoreState(const juce::ValueTree& state)
 
     selected = juce::jlimit(0, static_cast<int>(factoryPools().size() + customPools.size()) - 1,
                             static_cast<int>(state.getProperty("selected", 0)));
+    harmony.key = juce::jlimit(0, 11, static_cast<int>(state.getProperty("key", 0)));
+    harmony.scale = juce::jlimit(0, static_cast<int>(scales.size()) - 1, static_cast<int>(state.getProperty("scale", 0)));
+    harmony.octave = juce::jlimit(-1, 8, static_cast<int>(state.getProperty("octave", 4)));
+    harmony.motion = static_cast<Motion>(juce::jlimit(0, 3, static_cast<int>(state.getProperty("motion", 0))));
+    harmony.follow = static_cast<bool>(state.getProperty("followChords", false));
     poolEdits.reset();
     if (state.hasProperty("editedNotes"))
     {
@@ -301,6 +543,7 @@ void MidiNotes::restoreState(const juce::ValueTree& state)
     }
     Pattern restored;
     restored.length = juce::jlimit(0, maxPatternLength, static_cast<int>(state.getProperty("patternLength", 0)));
+    restored.mode = static_cast<Pattern::Mode>(juce::jlimit(0, 2, static_cast<int>(state.getProperty("phraseMode", 0))));
     const auto tokens = juce::StringArray::fromTokens(state.getProperty("pattern", "").toString(), false);
     const auto allowed = activePoolNotes();
     if (restored.length > 0 && tokens.size() <= maxPatternLength)
@@ -309,38 +552,61 @@ void MidiNotes::restoreState(const juce::ValueTree& state)
             if (tokens[i] == "-")
                 continue;
             const auto pitch = parsePitch(tokens[i]);
-            if (std::find(allowed.pitches.begin(), allowed.pitches.begin() + allowed.size, pitch)
-                == allowed.pitches.begin() + allowed.size)
+            if (pitch < 0 || (restored.mode != Pattern::kept
+                && std::find(allowed.pitches.begin(), allowed.pitches.begin() + allowed.size, pitch)
+                    == allowed.pitches.begin() + allowed.size))
             {
                 restored = {};
                 break;
             }
             restored.pitches[static_cast<std::size_t>(i)] = pitch;
         }
-    publishPool(restored);
+    if (restored.mode == Pattern::kept && restored.length == 0)
+        restored = {};
+    publishPool(restored, true);
 }
 
-int MidiNotes::beginBlock(juce::MidiBuffer& midi, bool playing, std::optional<int> baseLength)
+int MidiNotes::beginBlock(juce::MidiBuffer& midi, bool playing, std::optional<int> baseLength,
+                          PhraseCommand command, int captureLength)
 {
+    if (command != PhraseCommand::none)
+        queuedCommand.store(command);
     if (baseLength)
     {
         const juce::SpinLock::ScopedTryLockType lock(patternLock);
         if (lock.isLocked())
         {
+            if (seenHistoryRevision != historyRevision)
+            {
+                history = sharedHistory;
+                seenHistoryRevision = historyRevision;
+            }
+            if (changePhrase(queuedCommand.exchange(PhraseCommand::none), captureLength, history))
+                hostEdited.store(true);
             if (revision != seenRevision)
             {
                 notes = sharedNotes;
                 pattern = sharedPattern;
+                playingHarmony = sharedHarmony;
                 seenRevision = revision;
                 patternChanged = false;
-                cursor = 0;
+                velocities = sharedVelocities;
+                if (seenPhraseRestart != phraseRestart)
+                {
+                    cursor = 0;
+                    lastStep = -1;
+                    displayChanged = false;
+                    seenPhraseRestart = phraseRestart;
+                }
             }
-            if (pattern.length != *baseLength)
+            if (pattern.mode == Pattern::automatic && pattern.length != *baseLength)
             {
                 pattern = {};
                 pattern.length = *baseLength;
                 patternChanged = true;
                 cursor = 0;
+                lastStep = -1;
+                velocities.fill(0);
             }
         }
     }
@@ -352,6 +618,11 @@ int MidiNotes::beginBlock(juce::MidiBuffer& midi, bool playing, std::optional<in
     }
     releaseNotes = false;
     return pattern.length;
+}
+
+int MidiNotes::constrainedLength(int length) const
+{
+    return pattern.mode == Pattern::kept ? juce::jmin(length, pattern.length) : length;
 }
 
 void MidiNotes::setFinePitch(juce::MidiBuffer& midi, int frame, float cents, int bendRange, bool forNewNote)
@@ -367,11 +638,11 @@ void MidiNotes::setFinePitch(juce::MidiBuffer& midi, int frame, float cents, int
     }
 }
 
-void MidiNotes::flush(juce::MidiBuffer& midi)
+void MidiNotes::flush(juce::MidiBuffer& midi, int frame)
 {
     for (std::size_t i = 0; i < noteOffs.size(); ++i)
         if (noteOffs[i] != noDeadline)
-            midi.addEvent(juce::MidiMessage::noteOff(midiChannel, static_cast<int>(i)), 0);
+            midi.addEvent(juce::MidiMessage::noteOff(midiChannel, static_cast<int>(i)), frame);
     noteOffs.fill(noDeadline);
     earliestOff = noDeadline;
 }
@@ -396,35 +667,130 @@ void MidiNotes::emitNoteOffs(juce::MidiBuffer& midi, int frame, std::int64_t now
     }
 }
 
-int MidiNotes::pickPitch(int avoid)
+void MidiNotes::chordNote(int channel, int pitch, bool down)
 {
-    if (notes.size == 1)
-        return notes.pitches.front();
+    if (!juce::isPositiveAndBelow(pitch, 128) || !juce::isPositiveAndBelow(channel - 1, 16))
+        return;
+    auto& channels = chordHeld[static_cast<std::size_t>(pitch)];
+    const auto bit = 1u << (channel - 1);
+    const auto next = down ? channels | bit : channels & ~bit;
+    if (next != channels)
+    {
+        channels = next;
+        refreshChord();
+    }
+}
+
+void MidiNotes::clearChord(int channel)
+{
+    const auto mask = juce::isPositiveAndBelow(channel - 1, 16) ? ~(1u << (channel - 1)) : 0u;
+    for (auto& channels : chordHeld)
+        channels &= mask;
+    refreshChord();
+}
+
+void MidiNotes::refreshChord()
+{
+    chordClasses = 0;
+    for (std::size_t pitch = 0; pitch < chordHeld.size(); ++pitch)
+        if (chordHeld[pitch] != 0)
+            chordClasses |= 1u << (pitch % 12);
+    shownChord.store(chordClasses, std::memory_order_relaxed);
+}
+
+MidiNotes::Notes MidiNotes::playingNotes() const
+{
+    Notes chord;
+    const auto root = (playingHarmony.octave + 1) * 12 + playingHarmony.key;
+    if (playingHarmony.follow && chordClasses != 0)
+        for (int pitch = root; pitch < root + 12 && pitch <= 127; ++pitch)
+            if ((chordClasses & (1u << (pitch % 12))) != 0)
+                chord.pitches[static_cast<std::size_t>(chord.size++)] = pitch;
+    return chord.size > 0 ? chord : notes;
+}
+
+int MidiNotes::nearestPitch(const Notes& available, int pitch)
+{
+    const auto end = available.pitches.begin() + available.size;
+    return *std::min_element(available.pitches.begin(), end,
+        [pitch](int a, int b) { return std::abs(a - pitch) < std::abs(b - pitch); });
+}
+
+int MidiNotes::transposeByDegree(const Notes& available, int pitch, int degrees)
+{
+    if (degrees == 0 || available.size == 0)
+        return pitch;
+    unsigned classes = 0;
+    for (int i = 0; i < available.size; ++i)
+        classes |= 1u << (available.pitches[static_cast<std::size_t>(i)] % 12);
+    const int direction = degrees < 0 ? -1 : 1;
+    int lastDegree = pitch;
+    while (degrees != 0)
+    {
+        const auto next = pitch + direction;
+        if (next < 0 || next > 127)
+            break;
+        pitch = next;
+        if ((classes & (1u << (pitch % 12))) != 0)
+        {
+            lastDegree = pitch;
+            degrees -= direction;
+        }
+    }
+    return lastDegree;
+}
+
+int MidiNotes::pickPitch(const Notes& available, int avoid)
+{
+    if (available.size == 1)
+        return available.pitches.front();
+    if (playingHarmony.motion != Motion::random)
+    {
+        if (lastPitch < 0)
+            return available.pitches[static_cast<std::size_t>(random.nextInt(available.size))];
+        std::array<int, 128> weights {};
+        int total = 0;
+        for (int i = 0; i < available.size; ++i)
+        {
+            const auto distance = std::abs(available.pitches[static_cast<std::size_t>(i)] - lastPitch);
+            const auto weight = playingHarmony.motion == Motion::steady ? juce::jmax(1, 25 / (1 + distance * 2))
+                : playingHarmony.motion == Motion::leaps ? 1 + distance
+                : juce::jmax(1, 15 / (1 + std::abs(distance - 2)));
+            total += weight;
+            weights[static_cast<std::size_t>(i)] = total;
+        }
+        const auto choice = random.nextInt(total);
+        const auto at = std::upper_bound(weights.begin(), weights.begin() + available.size, choice) - weights.begin();
+        return available.pitches[static_cast<std::size_t>(at)];
+    }
+
     std::array<int, 128> options;
     int count = 0;
-    for (int i = 0; i < notes.size; ++i)
+    for (int i = 0; i < available.size; ++i)
     {
-        const auto pitch = notes.pitches[static_cast<std::size_t>(i)];
+        const auto pitch = available.pitches[static_cast<std::size_t>(i)];
         if (pitch != lastPitch && pitch != avoid)
             options[static_cast<std::size_t>(count++)] = pitch;
     }
-    return options[static_cast<std::size_t>(random.nextInt(count))];
+    return count > 0 ? options[static_cast<std::size_t>(random.nextInt(count))] : available.pitches.front();
 }
 
-int MidiNotes::nextPitch(int loopLength, int addressedStep)
+int MidiNotes::nextPitch(const Notes& available, int loopLength, int addressedStep)
 {
+    lastStep = -1;
     if (loopLength == 0)
-        return pickPitch();
+        return pickPitch(available);
 
     if (addressedStep >= 0)
     {
         auto& pitch = pattern.pitches[static_cast<std::size_t>(addressedStep)];
         if (pitch == Pattern::empty)
         {
-            pitch = pickPitch();
+            pitch = pickPitch(available);
             patternChanged = true;
         }
         cursor = (addressedStep + 1) % loopLength;
+        lastStep = addressedStep;
         return pitch;
     }
 
@@ -432,25 +798,47 @@ int MidiNotes::nextPitch(int loopLength, int addressedStep)
     const auto empty = std::find(pattern.pitches.begin(), end, Pattern::empty);
     if (empty != end)
     {
-        const auto avoidFirst = loopLength > 1 && empty == end - 1 && notes.size > 2;
-        *empty = pickPitch(avoidFirst ? pattern.pitches.front() : Pattern::empty);
+        const auto avoidFirst = loopLength > 1 && empty == end - 1 && available.size > 2;
+        *empty = pickPitch(available, avoidFirst ? pattern.pitches.front() : Pattern::empty);
         patternChanged = true;
         cursor = 0;
+        lastStep = static_cast<int>(empty - pattern.pitches.begin());
         return *empty;
     }
     cursor %= loopLength;
+    lastStep = cursor;
     const auto pitch = pattern.pitches[static_cast<std::size_t>(cursor)];
     cursor = (cursor + 1) % loopLength;
     return pitch;
 }
 
 void MidiNotes::trigger(juce::MidiBuffer& midi, int frame, int velocity, int loopLength, int noteSamples,
-                        int transpose, int addressedStep, float cents, int bendRange)
+                        int transpose, int addressedStep, float cents, int bendRange, bool scaleDegrees, bool monophonic)
 {
-    if (notes.size == 0)
+    const auto available = playingNotes();
+    if (available.size == 0)
         return;
-    const auto basePitch = nextPitch(loopLength, addressedStep);
-    const auto pitch = juce::jlimit(0, 127, basePitch + transpose);
+    const auto basePitch = nextPitch(available, loopLength, addressedStep);
+    const auto pitch = scaleDegrees ? transposeByDegree(available, basePitch, transpose)
+                                    : juce::jlimit(0, 127, basePitch + transpose);
+    if (monophonic && hasActiveNotes())
+        flush(midi, frame);
+    emitPitch(midi, frame, pitch, velocity, noteSamples, cents, bendRange);
+    lastPitch = basePitch;
+    history.push(basePitch, pitch, velocity);
+    if (lastStep >= 0)
+        velocities[static_cast<std::size_t>(lastStep)] = velocity;
+    displayChanged = true;
+}
+
+void MidiNotes::audition(juce::MidiBuffer& midi, int samples)
+{
+    emitPitch(midi, 0, 60, 100, samples, 0.0f, 2);
+}
+
+void MidiNotes::emitPitch(juce::MidiBuffer& midi, int frame, int pitch, int velocity, int noteSamples,
+                          float cents, int bendRange)
+{
     auto& deadline = noteOffs[static_cast<std::size_t>(pitch)];
     if (deadline != noDeadline)
         midi.addEvent(juce::MidiMessage::noteOff(midiChannel, pitch), frame);
@@ -460,7 +848,6 @@ void MidiNotes::trigger(juce::MidiBuffer& midi, int frame, int velocity, int loo
     deadline = sampleClock + frame + noteSamples;
     if (earliestOff == noDeadline || deadline < earliestOff)
         earliestOff = deadline;
-    lastPitch = basePitch;
     lastNote.store((velocity << 8) | (pitch + 1), std::memory_order_relaxed);
     sentNotes.fetch_add(1, std::memory_order_relaxed);
 }
@@ -468,12 +855,21 @@ void MidiNotes::trigger(juce::MidiBuffer& midi, int frame, int velocity, int loo
 void MidiNotes::endBlock(int frames)
 {
     sampleClock += frames;
-    if (!patternChanged)
+    if (!patternChanged && !displayChanged)
         return;
     const juce::SpinLock::ScopedTryLockType lock(patternLock);
     if (lock.isLocked() && revision == seenRevision)
     {
-        sharedPattern = pattern;
+        if (patternChanged)
+            sharedPattern = pattern;
+        if (displayChanged)
+        {
+            sharedHistory = history;
+            sharedVelocities = velocities;
+            sharedLast = lastStep;
+            sharedNext = cursor;
+        }
         patternChanged = false;
+        displayChanged = false;
     }
 }

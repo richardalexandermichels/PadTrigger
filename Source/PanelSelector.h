@@ -18,6 +18,9 @@ public:
         forward.setRepeatSpeed(400, 140);
         addAndMakeVisible(back);
         addAndMakeVisible(forward);
+        readout.setTitle("Choose " + title);
+        readout.onClick = [this] { if (onChoose && (!canChange || canChange())) onChoose(); };
+        addChildComponent(readout);
     }
 
     void setItems(juce::StringArray choices, int current = 0)
@@ -32,6 +35,7 @@ public:
     {
         index = juce::jlimit(0, juce::jmax(0, items.size() - 1), next);
         setDescription(getText());
+        readout.setDescription(getText());
         repaint();
     }
 
@@ -50,15 +54,17 @@ public:
 
     int getIndex() const { return index; }
     juce::String getText() const { return items[index]; }
-    std::function<void()> onChange;
-    std::function<bool()> canChange;
-
-private:
-    void step(int delta)
+    const juce::StringArray& getItems() const { return items; }
+    void enableDirectChoice(std::function<void()> show)
     {
-        if (items.size() <= 1 || (canChange && !canChange()))
+        onChoose = std::move(show);
+        readout.setVisible(onChoose != nullptr);
+    }
+
+    void choose(int next)
+    {
+        if (!juce::isPositiveAndBelow(next, items.size()) || index == next)
             return;
-        const auto next = (index + delta + items.size()) % items.size();
         if (attachment != nullptr)
             attachment->setValueAsCompleteGesture(static_cast<float>(next + parameterOffset));
         else
@@ -68,12 +74,23 @@ private:
                 onChange();
         }
     }
+    std::function<void()> onChange;
+    std::function<bool()> canChange;
+
+private:
+    void step(int delta)
+    {
+        if (items.size() <= 1 || (canChange && !canChange()))
+            return;
+        choose((index + delta + items.size()) % items.size());
+    }
 
     void resized() override
     {
         const auto bounds = getLocalBounds();
         back.setBounds(bounds.withWidth(21));
         forward.setBounds(bounds.withLeft(bounds.getRight() - 21));
+        readout.setBounds(bounds.reduced(23, 0));
     }
 
     void paint(juce::Graphics& g) override
@@ -97,5 +114,18 @@ private:
     int index = 0;
     int parameterOffset = 0;
     juce::TextButton back { "<" }, forward { ">" };
+    struct Readout final : juce::Button
+    {
+        Readout() : Button("Choose") {}
+        void paintButton(juce::Graphics& g, bool hover, bool down) override
+        {
+            if (hover || down || hasKeyboardFocus(false))
+            {
+                g.setColour(PanelTheme::teal.withAlpha(down ? 0.9f : 0.5f));
+                g.drawRoundedRectangle(getLocalBounds().toFloat().reduced(1.0f), 3.0f, 1.0f);
+            }
+        }
+    } readout;
+    std::function<void()> onChoose;
     std::unique_ptr<juce::ParameterAttachment> attachment;
 };

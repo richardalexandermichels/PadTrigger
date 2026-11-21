@@ -72,7 +72,8 @@ PoolEditor::PoolEditor(PadTrigger& owner) : trigger(owner)
     };
     pool.onChange = [this]
     {
-        if (trigger.midiNotes.selectPool(pool.getIndex()))
+        const auto scaleActive = trigger.midiNotes.getHarmony().scale > 0;
+        if (trigger.midiNotes.selectPool(pool.getIndex() - (scaleActive ? 1 : 0)))
             trigger.notifyStateEdited();
         reloadPool();
     };
@@ -206,7 +207,14 @@ void PoolEditor::reloadPool()
         selected = *details.edits;
     savedName = details.name;
     name.setText(savedName, false);
-    pool.setItems(trigger.midiNotes.poolNames(), trigger.midiNotes.selectedPool());
+    auto choices = trigger.midiNotes.poolNames();
+    const auto harmony = trigger.midiNotes.getHarmony();
+    if (harmony.scale > 0)
+        choices.insert(0, "Current scale");
+    pool.setItems(choices, harmony.scale > 0 ? 0 : trigger.midiNotes.selectedPool());
+    if (harmony.scale > 0 && harmony.octave != lastRegister)
+        octave.setIndex(harmony.octave + 1);
+    lastRegister = harmony.scale > 0 ? harmony.octave : -2;
     updateKeys();
     setStatus(details.edits ? "Playing edited notes. Save as a set." : "");
 }

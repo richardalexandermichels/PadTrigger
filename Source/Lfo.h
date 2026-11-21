@@ -31,8 +31,11 @@ inline constexpr std::array<Target, targetCount> targets {{
     { "Vel Floor", "lfoVelocity", 1.0f, 127.0f },
     { "Semitones", "lfoSemitones", -24.0f, 24.0f, "st" },
     { "Cents", "lfoCents", -100.0f, 100.0f, "ct" },
-    { "Pattern Position", "lfoPatternPosition", 0.0f, 100.0f }
+    { "Scan phrase", "lfoPatternPosition", 0.0f, 100.0f }
 }};
+
+inline const juce::StringArray gateNames { "ms", "1/2", "1/4", "1/8", "1/16", "1/16 T", "1/32" };
+inline constexpr std::array<double, 7> gateBeats { 0.0, 2.0, 1.0, 0.5, 0.25, 1.0 / 6.0, 0.125 };
 
 inline constexpr std::array<const char*, 7> shapes {{
     "Sine", "Triangle", "Ramp Up", "Ramp Down", "Square", "Pulse", "4 Steps"

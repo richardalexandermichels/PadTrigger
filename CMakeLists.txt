@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(PadTrigger VERSION 2.0.0 LANGUAGES C CXX)
+project(PadTrigger VERSION 2.1.0 LANGUAGES C CXX)
 
 include(FetchContent)
 set(JUCE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/deps/JUCE" CACHE PATH "Local JUCE source tree")
@@ -62,7 +62,9 @@ if(WIN32)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/padomizer-$<CONFIG>-build.txt" README.md DESIGN.md
         DESTINATION . COMPONENT Padomizer)
     install(FILES Assets/DSEG-LICENSE.txt DESTINATION Assets COMPONENT Padomizer)
-    install(FILES "Padomizer - One-track MIDI.RTrackTemplate" "Padomizer - Single drum note.RTrackTemplate"
+    install(FILES "Padomizer - Melodic Pluck.RTrackTemplate" "Padomizer - Bass Pulse.RTrackTemplate"
+        "Padomizer - Mallet Answer.RTrackTemplate"
+        "Padomizer - One-track MIDI.RTrackTemplate" "Padomizer - Single drum note.RTrackTemplate"
         "PadTrigger - One-track stereo.RTrackTemplate" "PadTrigger - sforzando Stereo Print.RTrackTemplate"
         DESTINATION TrackTemplates COMPONENT Padomizer)
     install(FILES "REAPER/PadTrigger - Record audio.lua" "REAPER/PadTrigger - Set up stereo print.lua"

@@ -39,6 +39,7 @@ private:
     juce::String savedName;
     juce::String pitchDisplay;
     unsigned poolVersion = 0;
+    int lastRegister = -2;
     std::array<Key, 12> keys;
     juce::TextEditor name;
     PanelSelector pool { "Note set" }, octave { "Octave" }, midiSource { "MIDI input" };
