@@ -25,9 +25,9 @@ public:
     juce::StringArray poolNames() const;
     int selectedPool() const;
     unsigned poolVersion() const { return poolChange.load(std::memory_order_relaxed); }
-    void selectPool(int index);
+    bool selectPool(int index);
     PoolDetails selectedPoolDetails() const;
-    void setPoolEdits(std::optional<std::bitset<128>>);
+    bool setPoolEdits(std::optional<std::bitset<128>>);
     juce::Result savePool(juce::String name, juce::String pitches);
     void resetPattern();
 
@@ -39,7 +39,7 @@ public:
     void restoreState(const juce::ValueTree&);
 
     void restartAudio() { releaseNotes = true; }
-    void beginBlock(juce::MidiBuffer&, bool playing, int baseLength);
+    int beginBlock(juce::MidiBuffer&, bool playing, std::optional<int> baseLength);
     void advance(juce::MidiBuffer& midi, int frame)
     {
         const auto now = sampleClock + frame;
@@ -47,8 +47,8 @@ public:
             emitNoteOffs(midi, frame, now);
     }
     void trigger(juce::MidiBuffer&, int frame, int velocity, int loopLength, int noteSamples,
-                 int transpose = 0, int addressedStep = -1);
-    void setFinePitch(juce::MidiBuffer&, int frame, float cents, int bendRange);
+                 int transpose = 0, int addressedStep = -1, float cents = 0.0f, int bendRange = 2);
+    void setFinePitch(juce::MidiBuffer&, int frame, float cents, int bendRange, bool forNewNote = false);
     bool hasActiveNotes() const { return earliestOff != noDeadline; }
     void endBlock(int frames);
 
@@ -110,5 +110,6 @@ private:
     std::array<std::int64_t, 128> noteOffs;
     std::int64_t sampleClock = 0, earliestOff = noDeadline;
     int lastWheel = 8192;
+    std::int64_t lastWheelFrame = noDeadline;
     bool releaseNotes = true;
 };

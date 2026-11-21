@@ -108,16 +108,16 @@ int MidiNotes::selectedPool() const
     return selected;
 }
 
-void MidiNotes::selectPool(int index)
+bool MidiNotes::selectPool(int index)
 {
     const juce::ScopedLock lock(poolLock);
     const auto count = static_cast<int>(factoryPools().size() + customPools.size());
-    if (juce::isPositiveAndBelow(index, count) && index != selected)
-    {
-        selected = index;
-        poolEdits.reset();
-        publishPool(Pattern{});
-    }
+    if (!juce::isPositiveAndBelow(index, count) || index == selected)
+        return false;
+    selected = index;
+    poolEdits.reset();
+    publishPool(Pattern{});
+    return true;
 }
 
 MidiNotes::PoolDetails MidiNotes::selectedPoolDetails() const
@@ -129,13 +129,14 @@ MidiNotes::PoolDetails MidiNotes::selectedPoolDetails() const
              {pool.notes.pitches.begin(), pool.notes.pitches.begin() + pool.notes.size}, poolEdits };
 }
 
-void MidiNotes::setPoolEdits(std::optional<std::bitset<128>> edits)
+bool MidiNotes::setPoolEdits(std::optional<std::bitset<128>> edits)
 {
     const juce::ScopedLock lock(poolLock);
     if (poolEdits == edits)
-        return;
+        return false;
     poolEdits = edits;
     publishPool(std::nullopt);
+    return true;
 }
 
 juce::Result MidiNotes::savePool(juce::String name, juce::String pitches)
@@ -152,6 +153,9 @@ juce::Result MidiNotes::savePool(juce::String name, juce::String pitches)
         return juce::Result::fail("Select at least one valid note.");
 
     const juce::ScopedLock lock(poolLock);
+    const auto active = activePoolNotes();
+    const auto unchanged = active.size == parsed.size
+        && std::is_permutation(active.pitches.begin(), active.pitches.begin() + active.size, parsed.pitches.begin());
     const auto existing = std::find_if(customPools.begin(), customPools.end(),
         [&name](const auto& pool) { return pool.name.equalsIgnoreCase(name); });
     selected = static_cast<int>(factoryPools().size() + (existing - customPools.begin()));
@@ -160,7 +164,10 @@ juce::Result MidiNotes::savePool(juce::String name, juce::String pitches)
     else
         *existing = { std::move(name), parsed };
     poolEdits.reset();
-    publishPool(Pattern{});
+    if (unchanged)
+        poolChange.fetch_add(1, std::memory_order_relaxed);
+    else
+        publishPool(Pattern{});
     return juce::Result::ok();
 }
 
@@ -313,25 +320,29 @@ void MidiNotes::restoreState(const juce::ValueTree& state)
     publishPool(restored);
 }
 
-void MidiNotes::beginBlock(juce::MidiBuffer& midi, bool playing, int baseLength)
+int MidiNotes::beginBlock(juce::MidiBuffer& midi, bool playing, std::optional<int> baseLength)
 {
+    if (baseLength)
     {
         const juce::SpinLock::ScopedTryLockType lock(patternLock);
-        if (lock.isLocked() && revision != seenRevision)
+        if (lock.isLocked())
         {
-            notes = sharedNotes;
-            pattern = sharedPattern;
-            seenRevision = revision;
-            patternChanged = false;
-            cursor = 0;
+            if (revision != seenRevision)
+            {
+                notes = sharedNotes;
+                pattern = sharedPattern;
+                seenRevision = revision;
+                patternChanged = false;
+                cursor = 0;
+            }
+            if (pattern.length != *baseLength)
+            {
+                pattern = {};
+                pattern.length = *baseLength;
+                patternChanged = true;
+                cursor = 0;
+            }
         }
-    }
-    if (pattern.length != baseLength)
-    {
-        pattern = {};
-        pattern.length = baseLength;
-        patternChanged = true;
-        cursor = 0;
     }
     if (!playing || releaseNotes)
     {
@@ -340,16 +351,19 @@ void MidiNotes::beginBlock(juce::MidiBuffer& midi, bool playing, int baseLength)
         setFinePitch(midi, 0, 0.0f, 1);
     }
     releaseNotes = false;
+    return pattern.length;
 }
 
-void MidiNotes::setFinePitch(juce::MidiBuffer& midi, int frame, float cents, int bendRange)
+void MidiNotes::setFinePitch(juce::MidiBuffer& midi, int frame, float cents, int bendRange, bool forNewNote)
 {
     constexpr int centre = 8192;
     const auto wheel = juce::jlimit(0, 16383, centre + juce::roundToInt(cents * centre / (100.0f * bendRange)));
-    if (wheel != lastWheel)
+    const auto now = sampleClock + frame;
+    if (wheel != lastWheel || (forNewNote && now != lastWheelFrame))
     {
         midi.addEvent(juce::MidiMessage::pitchWheel(midiChannel, wheel), frame);
         lastWheel = wheel;
+        lastWheelFrame = now;
     }
 }
 
@@ -431,7 +445,7 @@ int MidiNotes::nextPitch(int loopLength, int addressedStep)
 }
 
 void MidiNotes::trigger(juce::MidiBuffer& midi, int frame, int velocity, int loopLength, int noteSamples,
-                        int transpose, int addressedStep)
+                        int transpose, int addressedStep, float cents, int bendRange)
 {
     if (notes.size == 0)
         return;
@@ -440,6 +454,8 @@ void MidiNotes::trigger(juce::MidiBuffer& midi, int frame, int velocity, int loo
     auto& deadline = noteOffs[static_cast<std::size_t>(pitch)];
     if (deadline != noDeadline)
         midi.addEvent(juce::MidiMessage::noteOff(midiChannel, pitch), frame);
+    // A take may start between any two hits, even if the host is already playing.
+    setFinePitch(midi, frame, cents, bendRange, true);
     midi.addEvent(juce::MidiMessage::noteOn(midiChannel, pitch, static_cast<juce::uint8>(velocity)), frame);
     deadline = sampleClock + frame + noteSamples;
     if (earliestOff == noDeadline || deadline < earliestOff)

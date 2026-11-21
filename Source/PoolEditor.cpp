@@ -70,7 +70,12 @@ PoolEditor::PoolEditor(PadTrigger& owner) : trigger(owner)
         setStatus("Save or revert before changing sets.", true);
         return false;
     };
-    pool.onChange = [this] { trigger.midiNotes.selectPool(pool.getIndex()); reloadPool(); };
+    pool.onChange = [this]
+    {
+        if (trigger.midiNotes.selectPool(pool.getIndex()))
+            trigger.notifyStateEdited();
+        reloadPool();
+    };
     juce::StringArray octaves;
     for (int i = -1; i <= 9; ++i)
         octaves.add(juce::String(i));
@@ -123,7 +128,8 @@ PoolEditor::PoolEditor(PadTrigger& owner) : trigger(owner)
     revert.onClick = [this]
     {
         trigger.takeLearnedNotes();
-        trigger.midiNotes.setPoolEdits(std::nullopt);
+        if (trigger.midiNotes.setPoolEdits(std::nullopt))
+            trigger.notifyStateEdited();
         reloadPool();
         setStatus("Set restored.");
     };
@@ -209,7 +215,8 @@ bool PoolEditor::hasEdits() const { return selected != saved || name.getText() !
 
 void PoolEditor::applyEdits()
 {
-    trigger.midiNotes.setPoolEdits(selected != saved ? std::optional{selected} : std::nullopt);
+    if (trigger.midiNotes.setPoolEdits(selected != saved ? std::optional{selected} : std::nullopt))
+        trigger.notifyStateEdited();
     poolVersion = trigger.midiNotes.poolVersion();
     updateKeys();
     setStatus(selected != saved ? "Playing edited notes. Save as a set." : "");
@@ -318,6 +325,7 @@ void PoolEditor::save()
     const auto result = trigger.midiNotes.savePool(name.getText(), pitches.joinIntoString(" "));
     if (result.wasOk())
     {
+        trigger.notifyStateEdited();
         reloadPool();
         setStatus("Set saved.");
     }

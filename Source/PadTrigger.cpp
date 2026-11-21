@@ -6,6 +6,7 @@
 namespace
 {
 constexpr double maxSampleSeconds = 10.0;
+constexpr double maxDownwardPitchSemitones = 25.0;
 constexpr float minDb = -120.0f;
 
 float toDb(float level) { return juce::Decibels::gainToDecibels(level, minDb); }
@@ -54,6 +55,16 @@ PadTrigger::PadTrigger()
 {
     for (std::size_t i = 0; i < lfoDepth.size(); ++i)
         lfoDepth[i] = settings.getRawParameterValue(Lfo::targets[i].depth);
+}
+
+PadTrigger::~PadTrigger()
+{
+    stopTimer();
+}
+
+void PadTrigger::notifyStateEdited()
+{
+    updateHostDisplay(juce::AudioProcessorListener::ChangeDetails{}.withNonParameterStateChanged(true));
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout PadTrigger::createParameters()
@@ -112,6 +123,12 @@ bool PadTrigger::isBusesLayoutSupported(const BusesLayout& layout) const
     const auto mono = juce::AudioChannelSet::mono();
     const auto stereo = juce::AudioChannelSet::stereo();
     return (input == mono || input == stereo) && (output == mono || output == stereo);
+}
+
+double PadTrigger::getTailLengthSeconds() const
+{
+    // Hosts may cache this value across sample or pitch changes.
+    return maxSampleSeconds * std::exp2(maxDownwardPitchSemitones / 12.0);
 }
 
 void PadTrigger::prepareToPlay(double sampleRate, int)
@@ -186,8 +203,16 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
     const auto dynamicsRange = juce::jmax(3.0f, std::abs(levels.hard - levels.soft));
     const auto dynamicsFloor = (levels.soft + levels.hard - dynamicsRange) * 0.5f;
     const auto fullVelocityPeak = toGain(dynamicsFloor + dynamicsRange);
+    const auto midiMode = isMidiMode();
+    const auto midiPlaying = midiMode && !mutedForCalibration;
+    const auto baseLength = [&]
+    {
+        const juce::SpinLock::ScopedTryLockType lock(midiRestoreLock);
+        const auto length = lock.isLocked() ? std::optional{juce::roundToInt(patternLength->load())} : std::nullopt;
+        return midiNotes.beginBlock(midi, midiPlaying, length);
+    }();
     const std::array<float, Lfo::knobCount> base {{
-        sensitivity->load(), dynamics->load(), sampleGain->load(), patternLength->load(),
+        sensitivity->load(), dynamics->load(), sampleGain->load(), static_cast<float>(baseLength),
         noteLength->load(), retriggerMs->load(), velocityFloor->load(), pitchSemitones->load(), pitchCents->load()
     }};
     std::array<float, Lfo::targetCount> depth {};
@@ -212,16 +237,23 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
         phaseStep = lfoBpm / (60.0 * rate * beats);
         if (position && position->getIsPlaying())
             if (const auto ppq = position->getPpqPosition(); ppq && std::isfinite(*ppq))
-                lfoPhase = Lfo::wrap(*ppq / beats);
+            {
+                auto cycles = *ppq / beats;
+                const auto barStart = position->getPpqPositionOfLastBarStart();
+                const auto barIndex = position->getBarCount();
+                if (division < 4 && barStart && std::isfinite(*barStart) && (division == 3 || barIndex))
+                {
+                    const auto barsPerCycle = 4 - division;
+                    const auto bars = barIndex ? *barIndex % barsPerCycle : 0;
+                    cycles = (static_cast<double>(bars) + (*ppq - *barStart) / lfoBarBeats) / barsPerCycle;
+                }
+                lfoPhase = Lfo::wrap(cycles);
+            }
     }
     const auto phaseAt = [&](int frame) { return lfoPhase + phaseStep * frame; };
     const auto modulate = [&](Lfo::Knob knob, float signal) { return Lfo::apply(knob, base[knob], depth[knob], signal); };
-    const auto baseLength = juce::roundToInt(base[Lfo::pattern]);
     const auto samplesFromMs = [this](float ms) { return juce::jmax(1, juce::roundToInt(rate * ms / 1000.0)); };
     const auto holdFrames = samplesFromMs(base[Lfo::retrigger]);
-    const auto midiMode = isMidiMode();
-    const auto midiPlaying = midiMode && !mutedForCalibration;
-    midiNotes.beginBlock(midi, midiPlaying, baseLength);
 
     // A pending replacement is a short hand-off. A busy publisher never interrupts the current WAV.
     if (lastMidiMode != midiMode)
@@ -324,6 +356,7 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
         const bool aboveThreshold = !measuringNoise && amplitude >= minimum;
 
         bool hit = false;
+        auto rejection = StrokeDetector::Rejection::none;
         if (collecting)
         {
             if (measuringNoise)
@@ -346,6 +379,7 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
             if (detected.onset && depth[Lfo::retrigger] > 0.0f)
                 detector.holdOff(samplesFromMs(modulate(Lfo::retrigger, Lfo::wave(shape, phaseAt(frame)))));
             hit = detected.peak > 0.0f;
+            rejection = detected.rejection;
             if (hit && (midiMode || canPlay))
             {
                 const auto signal = modulateAtHit ? Lfo::wave(shape, phaseAt(frame)) : 0.0f;
@@ -362,10 +396,9 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
                     const auto length = juce::roundToInt(modulate(Lfo::pattern, signal));
                     const auto duration = samplesFromMs(modulate(Lfo::noteLength, signal));
                     const auto transpose = juce::roundToInt(modulate(Lfo::semitones, signal));
-                    if (bendEnabled)
-                        midiNotes.setFinePitch(midi, frame, modulate(Lfo::cents, signal), midiBendRange);
                     const auto step = Lfo::patternStep(length, positionDepth, signal);
-                    midiNotes.trigger(midi, frame, juce::roundToInt(velocity), length, duration, transpose, step);
+                    midiNotes.trigger(midi, frame, juce::roundToInt(velocity), length, duration,
+                                      transpose, step, modulate(Lfo::cents, signal), midiBendRange);
                 }
                 else
                 {
@@ -391,7 +424,7 @@ void PadTrigger::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer
                 outRight[frame] = right;
             outLeft[frame] = left;
         }
-        writeScope(raw, left, right, hit, aboveThreshold);
+        writeScope(raw, left, right, hit, aboveThreshold, rejection);
     }
     if (!canPlay)
         outputs.clear();
@@ -480,6 +513,7 @@ PadTrigger::Levels PadTrigger::measuredLevels() const
         case CalibrationStage::startHard:
         case CalibrationStage::hard:
         case CalibrationStage::retryHard:
+        case CalibrationStage::weak:
             return unpackLevels(previewLevels.load());
         default:
             return unpackLevels(savedLevels.load());
@@ -530,12 +564,26 @@ void PadTrigger::advanceCalibration()
         default:
             return;
     }
-    calibration.compare_exchange_strong(stage, next);
+    if (calibration.compare_exchange_strong(stage, next) && next == CalibrationStage::startHard)
+        startTimerHz(10);
 }
 
 void PadTrigger::cancelCalibration()
 {
-    calibration.store(CalibrationStage::idle);
+    auto stage = calibration.load();
+    while (stage != CalibrationStage::committing
+           && !calibration.compare_exchange_weak(stage, CalibrationStage::idle))
+    {
+    }
+}
+
+void PadTrigger::acceptWeakCalibration()
+{
+    const auto measured = previewLevels.load();
+    auto stage = CalibrationStage::weak;
+    if (calibration.compare_exchange_strong(stage, CalibrationStage::complete)
+        && savedLevels.exchange(measured) != measured)
+        notifyStateEdited();
 }
 
 void PadTrigger::beginCalibration(CalibrationStage stage)
@@ -588,7 +636,7 @@ bool PadTrigger::measureCalibrationHit(float amplitude, float gate, float quietG
         && calibrationArmed && amplitude >= gate;
     if (started)
     {
-        // Capture the full peak and keep ringing from becoming a second calibration stroke.
+        // Measure the isolated stroke. A quiet leading edge can precede the main impact.
         calibrationPeak = 0.0f;
         calibrationPeakRemaining = calibrationPeakSamples;
         calibrationCooldown = calibrationHoldSamples;
@@ -648,16 +696,39 @@ void PadTrigger::finishCalibration(CalibrationStage stage)
         candidate.hard = medianDb;
         candidate.calibrated = true;
         const bool weak = candidate.soft - candidate.noise < 9.0f || candidate.hard - candidate.soft < 6.0f;
-        const auto result = weak ? CalibrationStage::weak : CalibrationStage::complete;
-        if (calibration.compare_exchange_strong(stage, result))
-            savedLevels.store(packLevels(candidate));
+        if (weak)
+        {
+            previewLevels.store(packLevels(candidate));
+            calibration.compare_exchange_strong(stage, CalibrationStage::weak);
+        }
+        else if (calibration.compare_exchange_strong(stage, CalibrationStage::committing))
+        {
+            const auto measured = packLevels(candidate);
+            if (savedLevels.exchange(measured) != measured)
+                calibrationEdited.store(true);
+
+            // Publish completion after the saved data and host notification are ready.
+            calibration.store(CalibrationStage::complete);
+        }
     }
 }
 
-void PadTrigger::writeScope(float input, float left, float right, bool hit, bool aboveThreshold)
+void PadTrigger::timerCallback()
+{
+    const auto stage = calibration.load();
+    if (stage != CalibrationStage::startHard && stage != CalibrationStage::hard
+        && stage != CalibrationStage::committing)
+        stopTimer();
+
+    if (calibrationEdited.exchange(false))
+        notifyStateEdited();
+}
+
+void PadTrigger::writeScope(float input, float left, float right, bool hit, bool aboveThreshold,
+                            StrokeDetector::Rejection rejection)
 {
     if (scopeSamples == 0)
-        scopeFrame = { input, input, juce::jmin(left, right), juce::jmax(left, right), hit, aboveThreshold };
+        scopeFrame = { input, input, juce::jmin(left, right), juce::jmax(left, right), hit, aboveThreshold, rejection };
     else
     {
         scopeFrame.inputMin = juce::jmin(scopeFrame.inputMin, input);
@@ -666,6 +737,7 @@ void PadTrigger::writeScope(float input, float left, float right, bool hit, bool
         scopeFrame.outputMax = juce::jmax(scopeFrame.outputMax, left, right);
         scopeFrame.hit = scopeFrame.hit || hit;
         scopeFrame.aboveThreshold = scopeFrame.aboveThreshold || aboveThreshold;
+        scopeFrame.rejection = juce::jmax(scopeFrame.rejection, rejection);
     }
 
     if (++scopeSamples != scopeInterval)
@@ -674,7 +746,8 @@ void PadTrigger::writeScope(float input, float left, float right, bool hit, bool
     const auto bits = encodeScope(scopeFrame.inputMin) | (encodeScope(scopeFrame.inputMax) << 15)
         | (encodeScope(scopeFrame.outputMin) << 30) | (encodeScope(scopeFrame.outputMax) << 45)
         | (static_cast<std::uint64_t>(scopeFrame.hit) << 60)
-        | (static_cast<std::uint64_t>(scopeFrame.aboveThreshold) << 61);
+        | (static_cast<std::uint64_t>(scopeFrame.aboveThreshold) << 61)
+        | (static_cast<std::uint64_t>(scopeFrame.rejection) << 62);
     scopeFrames[scopeWriteIndex % scopeCapacity].store(bits, std::memory_order_relaxed);
     scopeEnd.store(++scopeWriteIndex, std::memory_order_release);
 }
@@ -688,7 +761,8 @@ std::uint64_t PadTrigger::readScope(Scope& destination) const
         const auto bits = scopeFrames[(end - count + i) % scopeCapacity].load(std::memory_order_relaxed);
         destination[scopeSize - count + i] = {
             decodeScope(bits), decodeScope(bits >> 15), decodeScope(bits >> 30),
-            decodeScope(bits >> 45), ((bits >> 60) & 1u) != 0, ((bits >> 61) & 1u) != 0
+            decodeScope(bits >> 45), ((bits >> 60) & 1u) != 0, ((bits >> 61) & 1u) != 0,
+            static_cast<StrokeDetector::Rejection>((bits >> 62) & 3u)
         };
     }
     return end;
@@ -728,7 +802,10 @@ void PadTrigger::renderSample(float& left, float& right, double step)
 
 juce::Result PadTrigger::loadSample(const juce::File& file)
 {
-    return replaceSample(file, false);
+    const auto result = replaceSample(file, false);
+    if (result.wasOk())
+        notifyStateEdited();
+    return result;
 }
 
 juce::Result PadTrigger::replaceSample(const juce::File& file, bool rememberMissing)
@@ -793,15 +870,26 @@ juce::String PadTrigger::sampleDescription() const
     return sampleAvailable ? sampleFile.getFileName() : "Missing or unreadable: " + sampleFile.getFileName();
 }
 
+juce::File PadTrigger::expectedSampleFile() const
+{
+    const juce::ScopedLock details(sampleDetailsLock);
+    return sampleFile;
+}
+
 void PadTrigger::getStateInformation(juce::MemoryBlock& data)
 {
-    auto state = settings.copyState();
+    auto state = [&]
+    {
+        const juce::SpinLock::ScopedLockType lock(midiRestoreLock);
+        auto copy = settings.copyState();
+        copy.appendChild(midiNotes.saveState(), nullptr);
+        return copy;
+    }();
     {
         const juce::ScopedLock details(sampleDetailsLock);
         state.setProperty("samplePath", sampleFile.getFullPathName(), nullptr);
     }
     state.setProperty("calibratedLevels", static_cast<juce::int64>(savedLevels.load()), nullptr);
-    state.appendChild(midiNotes.saveState(), nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary(*xml, data);
 }
@@ -822,7 +910,6 @@ void PadTrigger::setStateInformation(const void* data, int size)
     savedLevels.store(levels);
     state.removeProperty("calibratedLevels", nullptr);
     const auto notesState = state.getChildWithName("MidiNotes");
-    midiNotes.restoreState(notesState);
     if (notesState.isValid())
         state.removeChild(notesState, nullptr);
     if (const auto legacyAuto = state.getChildWithProperty("id", "autoRetrigger"); legacyAuto.isValid())
@@ -843,7 +930,9 @@ void PadTrigger::setStateInformation(const void* data, int size)
         restoreDefault(id);
     for (const auto& target : Lfo::targets)
         restoreDefault(target.depth);
+    const juce::SpinLock::ScopedLockType lock(midiRestoreLock);
     settings.replaceState(state);
+    midiNotes.restoreState(notesState);
 }
 
 juce::AudioProcessorEditor* PadTrigger::createEditor()

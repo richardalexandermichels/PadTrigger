@@ -15,6 +15,7 @@ const juce::Rectangle<int> lfoPanel { 24, 438, 306, 143 };
 const juce::Rectangle<int> pitchPanel { 341, 438, 139, 143 };
 const juce::Rectangle<int> keyboardPanel { 24, 593, 712, 166 };
 constexpr int caseWidth = 760, caseHeight = 779;
+constexpr int compactCaseHeight = 601;
 constexpr std::array<std::size_t, 4> mainKnobs { 0, 1, 2, 5 };
 constexpr std::size_t sampleOutputKnob = 2;
 constexpr std::size_t velocityFloorKnob = 6;
@@ -272,7 +273,11 @@ PadEditor::PadEditor(PadTrigger& owner)
     addAndMakeVisible(mode);
     addAndMakeVisible(poolEditor);
 
-    resetPattern.onClick = [this] { trigger.midiNotes.resetPattern(); };
+    resetPattern.onClick = [this]
+    {
+        trigger.midiNotes.resetPattern();
+        trigger.notifyStateEdited();
+    };
     resetPattern.setTooltip("Clear the loop. Your next stroke starts the new pattern.");
     addAndMakeVisible(resetPattern);
 
@@ -362,13 +367,28 @@ PadEditor::PadEditor(PadTrigger& owner)
     wavPath.setColour(juce::TextEditor::textColourId, ink);
     wavPath.setColour(juce::TextEditor::outlineColourId, border);
     wavPath.onReturnKey = [this] { loadWav(wavPath.getText()); };
-    loadButton.onClick = [this] { loadWav(wavPath.getText()); };
+    loadButton.onClick = [this]
+    {
+        const auto path = wavPath.getText();
+        if (path.trim().isEmpty())
+            browseWav();
+        else
+            loadWav(path);
+    };
     addAndMakeVisible(wavPath);
     calibrateButton.onClick = [this] { trigger.advanceCalibration(); updateCalibration(); };
     cancelButton.onClick = [this] { trigger.cancelCalibration(); updateCalibration(); };
+    acceptWeakButton.onClick = [this] { trigger.acceptWeakCalibration(); updateCalibration(); };
     addAndMakeVisible(loadButton);
+    toggleNoteSet.onClick = [this]
+    {
+        showNoteSetInWav = !showNoteSetInWav;
+        updateNoteSetVisibility();
+    };
+    addAndMakeVisible(toggleNoteSet);
     addAndMakeVisible(calibrateButton);
     addChildComponent(cancelButton);
+    addChildComponent(acceptWeakButton);
 
     for (auto* label : { &sampleStatus, &calibrationStatus, &calibrationLevels })
     {
@@ -498,13 +518,27 @@ void PadEditor::drawLfo(juce::Graphics& g) const
     g.drawText("LFO", bounds.reduced(13, 0).removeFromTop(34), juce::Justification::centredLeft);
     g.setFont(mono(11.0f));
     g.drawText(lfoShape.getText(), bounds.reduced(13, 0).removeFromTop(34), juce::Justification::centredRight);
-    if (showingMidi && (lfoTarget.getIndex() == Lfo::pattern || lfoTarget.getIndex() == Lfo::patternPosition)
-        && controls[3].knob.getValue() == 0.0)
+    const auto isPatternRoute = [](std::size_t target) { return target == Lfo::pattern || target == Lfo::patternPosition; };
+    const auto worksInMode = [this, isPatternRoute](std::size_t target)
     {
-        g.setColour(outputTrace);
-        g.drawText("Pattern Length 1-16 enables modulation.",
-            bounds.reduced(13, 0).removeFromBottom(18), juce::Justification::centredLeft);
-    }
+        if (target == Lfo::output)
+            return !showingMidi;
+        if (isPatternRoute(target) || target == Lfo::noteLength || target == Lfo::velocity)
+            return showingMidi;
+        return true;
+    };
+    const auto selected = static_cast<std::size_t>(lfoTarget.getIndex());
+    const bool hasLoop = controls[Lfo::pattern].knob.getValue() > 0.0;
+    int activeRoutes = 0;
+    for (std::size_t i = 0; i < Lfo::targets.size(); ++i)
+        if (worksInMode(i) && (!isPatternRoute(i) || hasLoop)
+            && trigger.getLfoDepth(static_cast<Lfo::Knob>(i)) > 0.0f)
+            ++activeRoutes;
+    const auto routeStatus = !worksInMode(selected) ? juce::String("Target inactive in this mode")
+        : isPatternRoute(selected) && !hasLoop ? juce::String("Pattern Length 1-16 enables modulation")
+        : juce::String(activeRoutes) + (activeRoutes == 1 ? " active route" : " active routes");
+    g.setColour(outputTrace);
+    g.drawText(routeStatus, bounds.reduced(13, 0).removeFromBottom(18), juce::Justification::centredLeft);
 
     const auto rack = bounds.withX(495).withWidth(241).toFloat();
     recessedPanel(g, rack);
@@ -572,12 +606,18 @@ void PadEditor::drawMidiDisplay(juce::Graphics& g) const
     g.drawText("MIDI OUT", header.removeFromLeft(118), juce::Justification::centredLeft);
     g.setFont(mono(11.0f));
     g.drawText("CH 1", header, juce::Justification::centredRight);
-    g.drawText(juce::String(midiNoteCount) + " NOTES SENT", header.withTrimmedRight(52), juce::Justification::centredRight);
+    g.drawText(poolEditor.hasNotes() ? juce::String(midiNoteCount) + " NOTES SENT" : "CHOOSE AT LEAST ONE NOTE",
+               header.withTrimmedRight(52), juce::Justification::centredRight);
 
     const auto pitch = (recentMidi & 255) - 1;
     const auto note = pitch >= 0 ? juce::MidiMessage::getMidiNoteName(pitch, true, true, 4) : juce::String("--");
     const auto velocity = pitch >= 0 ? juce::String(recentMidi >> 8) : juce::String("--");
     auto pitchCell = content.removeFromLeft(150);
+    if (pitch >= 0)
+    {
+        g.drawText("MIDI " + juce::String(pitch), pitchCell.removeFromBottom(15),
+                   juce::Justification::centredLeft);
+    }
     g.setColour(juce::Colours::white);
     g.setFont(lcd(49.0f));
     if (note.containsChar('#'))
@@ -670,6 +710,8 @@ void PadEditor::drawScope(juce::Graphics& g, juce::Rectangle<int> panel, bool in
     }
 
     juce::Path waveform, aboveThreshold, hitMarks;
+    using Rejection = StrokeDetector::Rejection;
+    std::array<juce::Path, 3> rejected;
     for (std::size_t i = 0; i < scope.size(); ++i)
     {
         const auto& frame = scope[i];
@@ -683,6 +725,12 @@ void PadEditor::drawScope(juce::Graphics& g, juce::Rectangle<int> panel, bool in
         {
             hitMarks.startNewSubPath(x, grid.getY());
             hitMarks.lineTo(x, grid.getBottom());
+        }
+        else if (input && frame.rejection != Rejection::none)
+        {
+            auto& marks = rejected[static_cast<std::size_t>(frame.rejection) - 1];
+            marks.startNewSubPath(x, grid.getY());
+            marks.lineTo(x, grid.getY() + 8.0f);
         }
     }
     g.setColour(colour.withAlpha(0.24f));
@@ -700,16 +748,28 @@ void PadEditor::drawScope(juce::Graphics& g, juce::Rectangle<int> panel, bool in
     g.drawText("NOW", footer, juce::Justification::centredRight);
     if (input)
     {
+        const std::array<juce::Colour, 3> rejectionColours { juce::Colour(0xff91cbff), danger, juce::Colour(0xffd8a6ff) };
+        for (std::size_t i = 0; i < rejected.size(); ++i)
+        {
+            g.setColour(rejectionColours[i]);
+            g.strokePath(rejected[i], juce::PathStrokeType(1.5f));
+        }
         if (gateDb)
         {
-            auto gateLabel = "THRESHOLD " + db(*gateDb) + " dBFS";
+            auto gateLabel = "GATE " + db(*gateDb) + " dBFS";
             if (gate > scale)
                 gateLabel += " (OFF SCALE)";
             g.setColour(thresholdColour);
-            g.drawText(gateLabel, footer.withTrimmedLeft(68).withWidth(243), juce::Justification::centred);
+            g.drawText(gateLabel, footer.withTrimmedLeft(65).withWidth(172), juce::Justification::centredLeft);
         }
         g.setColour(hitColour);
-        g.drawText("| = HIT", footer.withTrimmedLeft(312).withWidth(65), juce::Justification::centred);
+        g.drawText("HIT", footer.withTrimmedLeft(239).withWidth(28), juce::Justification::centred);
+        g.setColour(rejectionColours[0]);
+        g.drawText("LOW", footer.withTrimmedLeft(269).withWidth(29), juce::Justification::centred);
+        g.setColour(rejectionColours[2]);
+        g.drawText("HOLD", footer.withTrimmedLeft(301).withWidth(34), juce::Justification::centred);
+        g.setColour(rejectionColours[1]);
+        g.drawText("ATTACK", footer.withTrimmedLeft(339).withWidth(46), juce::Justification::centred);
 
     }
     else
@@ -736,6 +796,7 @@ void PadEditor::resized()
     cancelButton.setBounds(659, 302, 63, 29);
     wavPath.setBounds(37, 378, 253, 23);
     loadButton.setBounds(296, 378, 55, 23);
+    toggleNoteSet.setBounds(605, 381, 117, 27);
     sampleStatus.setBounds(36, 401, 311, 20);
     controls[3].label.setBounds(375, 359, 111, 16);
     controls[3].knob.setBounds(391, 373, 80, 52);
@@ -762,6 +823,7 @@ void PadEditor::resized()
 void PadEditor::updateMode()
 {
     showingMidi = trigger.isMidiMode();
+    updateNoteSetVisibility();
     bendRange.setVisible(showingMidi);
     wavPath.setVisible(!showingMidi);
     loadButton.setVisible(!showingMidi);
@@ -777,6 +839,20 @@ void PadEditor::updateMode()
         controls[i].knob.setEnabled(showingMidi);
     }
     repaint();
+}
+
+void PadEditor::updateNoteSetVisibility()
+{
+    const bool show = showingMidi || showNoteSetInWav;
+    poolEditor.setVisible(show);
+    toggleNoteSet.setVisible(!showingMidi);
+    toggleNoteSet.setButtonText(show ? "Hide note set" : "Show note set");
+    const auto height = show ? caseHeight : compactCaseHeight;
+    if (getHeight() != height)
+    {
+        caseMaterial = makeCaseMaterial(caseWidth, height);
+        setSize(caseWidth, height);
+    }
 }
 
 void PadEditor::updateCalibration()
@@ -831,6 +907,7 @@ void PadEditor::updateCalibration()
             break;
         case Stage::startHard:
         case Stage::hard:
+        case Stage::committing:
             title = "Capturing hard hits";
             status = (stage == Stage::startHard ? juce::String("Waiting for mic input.")
                                                : "Captured " + count + " hard hits.")
@@ -838,10 +915,22 @@ void PadEditor::updateCalibration()
             enabled = false;
             break;
         case Stage::complete:
-        case Stage::weak:
             title = "Recalibrate";
             status = savedStatus();
             break;
+        case Stage::weak:
+        {
+            title = "Retry";
+            const auto separation = levels.hard - levels.soft;
+            const auto aboveNoise = levels.soft - levels.noise;
+            if (separation < 0.0f)
+                status = "Accents measured " + juce::String(-separation, 1) + " dB quieter than the taps.";
+            else if (aboveNoise < 9.0f)
+                status = "Soft taps measured only " + juce::String(aboveNoise, 1) + " dB above room noise.";
+            else
+                status = "Accents measured only " + juce::String(separation, 1) + " dB louder than the taps.";
+            break;
+        }
         case Stage::interrupted:
             status = "Audio stopped during capture. Enable monitoring and restart.";
             break;
@@ -856,9 +945,9 @@ void PadEditor::updateCalibration()
 
     const bool haveNoise = levels.calibrated || stage == Stage::readySoft || stage == Stage::startSoft
         || stage == Stage::soft || stage == Stage::retrySoft || stage == Stage::readyHard
-        || stage == Stage::startHard || stage == Stage::hard || stage == Stage::retryHard;
+        || stage == Stage::startHard || stage == Stage::hard || stage == Stage::retryHard || stage == Stage::committing;
     const bool haveSoft = levels.calibrated || stage == Stage::readyHard || stage == Stage::startHard
-        || stage == Stage::hard || stage == Stage::retryHard;
+        || stage == Stage::hard || stage == Stage::retryHard || stage == Stage::committing;
     const auto read = [](float value, bool available) { return available ? db(value) : juce::String("-"); };
     const auto values = "N " + read(levels.noise, haveNoise) + "   S " + read(levels.soft, haveSoft)
         + "   H " + read(levels.hard, levels.calibrated);
@@ -879,10 +968,12 @@ void PadEditor::updateCalibration()
     }
     controls[velocityFloorKnob].knob.setEnabled(enabled);
     controls[velocityFloorKnob].label.setEnabled(enabled);
-    const bool active = stage != Stage::idle && stage != Stage::complete && stage != Stage::weak
-        && stage != Stage::interrupted;
+    const bool weak = stage == Stage::weak;
+    const bool active = stage != Stage::idle && stage != Stage::complete && stage != Stage::interrupted;
     cancelButton.setVisible(active);
-    calibrateButton.setBounds(511, 302, active ? 141 : 211, 29);
+    acceptWeakButton.setVisible(weak);
+    acceptWeakButton.setBounds(569, 302, 84, 29);
+    calibrateButton.setBounds(511, 302, weak ? 52 : active ? 141 : 211, 29);
 }
 
 void PadEditor::timerCallback()
@@ -893,8 +984,8 @@ void PadEditor::timerCallback()
     {
         recentMidi = trigger.midiNotes.lastEvent();
         midiNoteCount = trigger.midiNotes.noteCount();
-        const auto baseLength = static_cast<int>(controls[3].knob.getValue());
-        displayedPatternLength = baseLength > 0 && trigger.settings.getRawParameterValue("lfoPattern")->load() > 0.0f
+        const auto baseLength = static_cast<int>(controls[Lfo::pattern].knob.getValue());
+        displayedPatternLength = baseLength > 0 && trigger.getLfoDepth(Lfo::pattern) > 0.0f
             ? juce::jmax(1, trigger.livePatternLength()) : baseLength;
         recentPattern = trigger.midiNotes.patternDescription(displayedPatternLength);
         resetPattern.setEnabled(controls[3].knob.getValue() > 0.0);
@@ -931,12 +1022,16 @@ void PadEditor::timerCallback()
     updatePeak(in, inputPeak, inputPeakUntil, inputClipUntil);
     updatePeak(out, outputPeak, outputPeakUntil, outputClipUntil);
 
-    const auto description = sampleError.isEmpty() ? trigger.sampleDescription() : sampleError;
+    const auto activeSample = trigger.sampleDescription();
+    const bool typedPath = wavPath.getText().trim().isNotEmpty();
+    loadButton.setButtonText(typedPath ? "Load" : "Browse");
+    const auto description = sampleError.isEmpty() ? activeSample : activeSample + "  |  " + sampleError;
     if (sampleStatus.getText() != description)
     {
         sampleStatus.setText(description, juce::dontSendNotification);
-        sampleStatus.setTooltip(description);
     }
+    const auto expected = trigger.expectedSampleFile();
+    sampleStatus.setTooltip(expected == juce::File() ? description : description + "\n" + expected.getFullPathName());
     updateCalibration();
     repaint(micPanel);
     repaint(outputPanel);
@@ -965,7 +1060,20 @@ void PadEditor::loadWav(const juce::String& path)
         return;
     }
     const auto result = trigger.loadSample(juce::File(filePath));
-    sampleError = result.getErrorMessage();
+    sampleError = result.wasOk() ? juce::String() : juce::File(filePath).getFileName() + " failed. " + result.getErrorMessage();
     if (result.wasOk())
         wavPath.clear();
+}
+
+void PadEditor::browseWav()
+{
+    sampleChooser = std::make_unique<juce::FileChooser>("Load or relink a WAV sample", trigger.expectedSampleFile(), "*.wav");
+    const juce::Component::SafePointer<PadEditor> self(this);
+    sampleChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+        [self](const juce::FileChooser& chooser)
+        {
+            const auto file = chooser.getResult();
+            if (self != nullptr && file != juce::File())
+                self->loadWav(file.getFullPathName());
+        });
 }

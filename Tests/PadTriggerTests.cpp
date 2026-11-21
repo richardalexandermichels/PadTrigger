@@ -2,9 +2,12 @@
 #include "PadEditor.h"
 #include "PoolEditor.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <future>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace
@@ -155,6 +158,8 @@ void checkMidiPatterns()
     for (const auto event : rapid)
     {
         const auto message = event.getMessage();
+        if (!message.isNoteOnOrOff())
+            continue;
         require(message.isNoteOn() != noteIsOn, "Overlapping repeated pitches must send note-off before note-on");
         noteIsOn = message.isNoteOn();
     }
@@ -237,6 +242,26 @@ void checkVelocityFloor()
     juce::AudioProcessor::copyXmlToBinary(oldState, saved);
     restored.setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
     require(restored.settings.getRawParameterValue("velocityFloor")->load() == 72.0f, "Old projects missed the new default floor");
+}
+
+void checkVelocityDecisionWindow()
+{
+    PadTrigger plugin;
+    plugin.prepareToPlay(rate, blockSize);
+    setParameter(plugin, "soundMode", 1.0f);
+    juce::MidiBuffer midi;
+    process(plugin, 14000, [](int frame)
+    {
+        return stroke(frame, 2000, 0.004f) + stroke(frame, 2032, 0.03f)
+            + stroke(frame, 10000, 0.004f) + stroke(frame, 10480, 0.03f);
+    }, &midi);
+    std::vector<std::pair<int, int>> attacks;
+    for (const auto event : midi)
+        if (const auto message = event.getMessage(); message.isNoteOn())
+            attacks.emplace_back(event.samplePosition, message.getVelocity());
+    require(attacks.size() == 2 && attacks[0].second > attacks[1].second
+                && attacks[0].first <= 2071 && attacks[1].first == 10071,
+            "Crest handling changed the velocity decision window or added a duplicate note");
 }
 
 void checkPadRinging()
@@ -338,6 +363,85 @@ void checkDetectorTimingAndChannels()
             * std::cos(juce::MathConstants<float>::twoPi * 200.0f * t / rate);
         return std::array<float, 2>{ 0.0f, soft };
     }, 1600, 1.0f) == std::vector<int>{692}, "A quiet rising stroke was missed or emitted before crossing its gate");
+}
+
+void checkWeakFollowUps()
+{
+    constexpr float gate = 0.00019952623f;
+    constexpr int first = 2400;
+    const auto run = [=](int gapMs, float tap, float tail, int phase, float frequency)
+    {
+        StrokeDetector detector;
+        detector.prepare(rate);
+        std::vector<int> hits;
+        const auto second = first + gapMs * rate / 1000;
+        for (int frame = 0; frame < second + rate / 10; ++frame)
+        {
+            const auto elapsed = static_cast<float>(frame - first) / rate;
+            const auto ring = elapsed >= 0.0f ? tail * std::exp(-elapsed / 0.06f)
+                * std::sin(juce::MathConstants<float>::twoPi * (frequency * elapsed + phase / 24.0f)) : 0.0f;
+            const auto sample = stroke(frame, first, 0.15f) + ring + stroke(frame, second, tap);
+            if (detector.process({sample, 0.0f}, 1, gate, gate * 0.45f, rate * 8 / 1000, 0.04f).peak > 0.0f)
+                hits.push_back(frame);
+        }
+        return hits;
+    };
+
+    require(run(10, 0.00035f, 0.0f, 0, 180.0f) == std::vector<int>{first, first + rate / 100 + 71},
+            "A hard accent still suppressed a weak tap after the input rearmed");
+    for (const auto gap : {16, 30, 65})
+        for (int phase = 0; phase < 24; ++phase)
+        {
+            require(run(gap, 0.0f, 0.0005f, phase, 180.0f) == std::vector<int>{first},
+                    "A low-frequency tail produced a false second note");
+            const auto pair = run(gap, 0.0006f, 0.0005f, phase, 180.0f);
+            const auto second = first + gap * rate / 1000;
+            require(pair.size() == 2 && pair[0] == first && pair[1] >= second && pair[1] <= second + 72,
+                    "A real follow-up was missed or delayed over a low-frequency tail");
+        }
+    for (const auto frequency : {3500.0f, 12000.0f, 15000.0f})
+        require(run(65, 0.0f, 0.003f, 0, frequency) == std::vector<int>{first},
+                "A bright resonant tail produced a false second note");
+}
+
+void checkGradualAttackDuringRinging()
+{
+    for (const auto sampleRate : { 44100, 48000, 96000 })
+    {
+        const auto run = [sampleRate](bool playFollowUp)
+        {
+            StrokeDetector detector;
+            detector.prepare(sampleRate);
+            std::vector<float> hits;
+            const auto oscillation = [](float seconds, float frequency)
+            {
+                return std::cos(juce::MathConstants<float>::twoPi * seconds * frequency);
+            };
+            constexpr float gate = 0.000199526f;
+            for (int frame = 0; frame < sampleRate / 3; ++frame)
+            {
+                const auto time = frame / static_cast<float>(sampleRate);
+                const auto accentTime = time - 0.05f;
+                const auto tapTime = time - 0.135f;
+                const auto accent = accentTime >= 0.0f && accentTime < 0.012f
+                    ? 0.12f * std::exp(-accentTime / 0.0006f) * oscillation(accentTime, 4800.0f) : 0.0f;
+                const auto tail = accentTime >= 0.0f
+                    ? 0.00025f * std::exp(-accentTime / 0.25f) * oscillation(accentTime, 180.0f) : 0.0f;
+                const auto tap = playFollowUp && tapTime >= 0.0f && tapTime < 0.01f
+                    ? 0.001f * std::min(1.0f, tapTime / 0.0003f) * std::exp(-tapTime / 0.0018f)
+                        * oscillation(tapTime, 450.0f) : 0.0f;
+                if (detector.process({ accent + tail + tap, 0.0f }, 1, gate, gate * 0.45f,
+                                     sampleRate / 20, 0.035f).peak > 0.0f)
+                    hits.push_back(time);
+            }
+            return hits;
+        };
+
+        require(run(false).size() == 1, "A sustained tail produced a false note at 50 ms Retrigger");
+        const auto pair = run(true);
+        require(pair.size() == 2 && pair[1] >= 0.135f && pair[1] <= 0.1375f,
+                "A gradual attack over a sustained tail was missed or delayed");
+    }
 }
 
 void checkHostBlockLatency()
@@ -471,6 +575,104 @@ void checkMidiPitch()
             "Pitch controls or routing failed to restore");
 }
 
+void checkSelfContainedPitchBend()
+{
+    PadTrigger plugin;
+    plugin.prepareToPlay(rate, blockSize);
+    setParameter(plugin, "soundMode", 1.0f);
+    setParameter(plugin, "pitchCents", 50.0f);
+    for (const auto cents : {50.0f, 50.0f, 0.0f, 0.0f})
+    {
+        setParameter(plugin, "pitchCents", cents);
+        const auto take = playStrokes(plugin, 1);
+        int lastBendFrame = -1, wheel = -1, count = 0;
+        for (const auto event : take)
+        {
+            const auto message = event.getMessage();
+            if (message.isPitchWheel())
+            {
+                lastBendFrame = event.samplePosition;
+                wheel = message.getPitchWheelValue();
+            }
+            if (message.isNoteOn())
+            {
+                ++count;
+                require(lastBendFrame == event.samplePosition && wheel == (cents == 0.0f ? 8192 : 10240),
+                        "A new take could start with a missing or stale pitch bend");
+            }
+        }
+        require(count == 1, "Bend fixture did not generate one note");
+    }
+}
+
+void checkConcurrentPatternRestore()
+{
+    const auto makeState = [](int length, int pitch)
+    {
+        PadTrigger fixture;
+        setParameter(fixture, "soundMode", 1.0f);
+        setParameter(fixture, "patternLength", static_cast<float>(length));
+        setParameter(fixture, "retriggerMs", 8.0f);
+        juce::ValueTree notes("MidiNotes");
+        notes.setProperty("patternLength", length, nullptr);
+        juce::StringArray slots;
+        for (int i = 0; i < length; ++i)
+            slots.add(juce::String(pitch));
+        notes.setProperty("pattern", slots.joinIntoString(" "), nullptr);
+        fixture.midiNotes.restoreState(notes);
+        juce::MemoryBlock state;
+        fixture.getStateInformation(state);
+        return state;
+    };
+    const auto shorter = makeState(1, 60);
+    const auto longer = makeState(4, 64);
+    PadTrigger plugin;
+    plugin.prepareToPlay(rate, blockSize);
+    plugin.setStateInformation(shorter.getData(), static_cast<int>(shorter.getSize()));
+    std::atomic<bool> started { false };
+    std::thread writer([&]
+    {
+        while (!started.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        for (int i = 0; i < 500; ++i)
+        {
+            const auto& state = i % 2 == 0 ? longer : shorter;
+            plugin.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+        }
+    });
+    started.store(true, std::memory_order_release);
+    juce::AudioBuffer<float> audio(2, blockSize);
+    juce::MidiBuffer midi;
+    midi.ensureSize(256);
+    int count = 0, unexpected = 0;
+    for (int start = 0; start < rate * 5; start += blockSize)
+    {
+        audio.clear();
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto frame = (start + sample) % 960;
+            audio.setSample(0, sample, stroke(frame, 160, 0.08f));
+        }
+        plugin.processBlock(audio, midi);
+        for (const auto event : midi)
+            if (const auto message = event.getMessage(); message.isNoteOn())
+            {
+                ++count;
+                if (message.getNoteNumber() != 60 && message.getNoteNumber() != 64)
+                    ++unexpected;
+            }
+    }
+    writer.join();
+    require(count > 100 && unexpected == 0, "A concurrent restore discarded saved pattern slots");
+    require(notePitches(playStrokes(plugin, 4)) == std::vector<int>(4, 60),
+            "The last restored pattern did not survive concurrent processing");
+
+    require(plugin.midiNotes.savePool("Saved during play", "C4 D4 E4 G4 A4 C5 D5 E5").wasOk(),
+            "Could not name an unchanged note set");
+    require(notePitches(playStrokes(plugin, 4)) == std::vector<int>(4, 60),
+            "Saving the unchanged pitch set discarded the learned pattern");
+}
+
 void checkNoteRate()
 {
     PadTrigger plugin;
@@ -510,6 +712,15 @@ void checkLfoAndPattern()
     setParameter(plugin, "lfoDivision", 0.0f);
     process(plugin, 1, noise);
     require(std::abs(plugin.lfoPosition() - 0.5f) < 0.001f, "4/1 did not follow the host's bar length");
+    host.position.setPpqPosition(4.0);
+    host.position.setPpqPositionOfLastBarStart(4.0);
+    host.position.setBarCount(1);
+    setParameter(plugin, "lfoDivision", 3.0f);
+    process(plugin, 1, noise);
+    require(plugin.lfoPosition() < 0.001f, "The first 3/4 downbeat did not restart the one-bar LFO");
+    setParameter(plugin, "lfoDivision", 0.0f);
+    process(plugin, 1, noise);
+    require(std::abs(plugin.lfoPosition() - 0.25f) < 0.001f, "A meter change lost the bar index within a four-bar LFO");
     host.position.setPpqPosition(0.03125);
     setParameter(plugin, "lfoDivision", 17.0f);
     process(plugin, 1, noise);
@@ -731,10 +942,92 @@ void calibrate(PadTrigger& plugin)
     require(plugin.calibrationStage() == Stage::complete, "Hard accents did not complete calibration");
 }
 
+void checkCalibrationWithLateAccentPeak()
+{
+    PadTrigger plugin;
+    plugin.prepareToPlay(rate, blockSize);
+    plugin.advanceCalibration();
+    process(plugin, 2 * rate, noise);
+    const auto padHit = [](int frame, int onset, bool accent)
+    {
+        return noise(frame) + stroke(frame, onset, accent ? 0.00004f : 0.00045f)
+            + (accent ? stroke(frame, onset + 480, 0.003f) : 0.0f);
+    };
+    const auto capture = [&](bool accent)
+    {
+        plugin.advanceCalibration();
+        const auto spacing = rate / 2;
+        process(plugin, 5 * spacing, [&](int frame)
+        {
+            return padHit(frame, (frame / spacing) * spacing + 4800, accent);
+        });
+        require(plugin.calibrationHitCount() == 5, "A two-part accent was counted incorrectly");
+    };
+    capture(false);
+    capture(true);
+    const auto levels = plugin.measuredLevels();
+    require(plugin.calibrationStage() == Stage::complete && levels.hard - levels.soft > 12.0f,
+            "Calibration mistook an accent with a quiet leading edge for a softer stroke");
+
+    setParameter(plugin, "soundMode", 1.0f);
+    juce::MidiBuffer midi;
+    process(plugin, rate / 2, [&](int frame)
+    {
+        return frame < rate / 4 ? padHit(frame, 4800, false) : padHit(frame, rate / 4 + 4800, true);
+    }, &midi);
+    std::vector<int> velocities;
+    for (const auto event : midi)
+        if (const auto message = event.getMessage(); message.isNoteOn())
+            velocities.push_back(message.getVelocity());
+    require(velocities.size() == 2 && velocities[0] < velocities[1],
+            "Live replay did not produce one louder note for the accent");
+}
+
+void checkProjectEditNotifications(const juce::File& sample)
+{
+    struct Listener final : juce::AudioProcessorListener
+    {
+        void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
+        void audioProcessorChanged(juce::AudioProcessor*, const ChangeDetails& details) override
+        {
+            changes += details.nonParameterStateChanged ? 1 : 0;
+        }
+        int changes = 0;
+    } listener;
+
+    PadTrigger plugin;
+    plugin.addListener(&listener);
+    plugin.prepareToPlay(rate, blockSize);
+    require(plugin.loadSample(sample).wasOk() && listener.changes == 1,
+            "Loading a WAV did not notify the project host");
+    require(plugin.loadSample(sample.getSiblingFile("missing-recall-fixture.wav")).failed()
+                && listener.changes == 1, "A failed WAV load notified the project host");
+
+    juce::MemoryBlock saved;
+    plugin.getStateInformation(saved);
+    plugin.setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
+    require(listener.changes == 1, "Restoring a project marked it modified");
+
+    plugin.advanceCalibration();
+    plugin.cancelCalibration();
+    require(listener.changes == 1, "A cancelled calibration marked the project modified");
+    calibrate(plugin);
+    require(listener.changes == 1, "Calibration notified the project host during audio processing");
+    for (int retry = 0; retry < 25 && listener.changes == 1; ++retry)
+    {
+        juce::Thread::sleep(10);
+        juce::Timer::callPendingTimersSynchronously();
+    }
+    require(listener.changes == 2, "A completed calibration did not notify the project host");
+    plugin.removeListener(&listener);
+}
+
 void checkCalibrationCapture()
 {
     PadTrigger plugin;
     plugin.prepareToPlay(rate, blockSize);
+    calibrate(plugin);
+    const auto previous = plugin.measuredLevels();
     setParameter(plugin, "sensitivity", -12.0f);
     setParameter(plugin, "dynamics", 2.5f);
     setParameter(plugin, "sampleGain", -48.0f);
@@ -775,9 +1068,21 @@ void checkCalibrationCapture()
     capture(5, 0.00041f);
     const auto levels = plugin.measuredLevels();
     require(plugin.calibrationStage() == Stage::weak && plugin.calibrationHitCount() == 5 && levels.calibrated,
-            "Hard strikes with less than 6 dB separation should save with a warning");
+            "A hard-to-soft separation below 6 dB should require review");
     require(levels.hard > -69.0f && levels.hard > levels.soft && levels.hard - levels.soft < 6.0f,
             "Calibration missed the full peak of the delayed hard strikes");
+    plugin.cancelCalibration();
+    const auto cancelled = plugin.measuredLevels();
+    require(cancelled.calibrated && cancelled.noise == previous.noise
+                && cancelled.soft == previous.soft && cancelled.hard == previous.hard,
+            "Cancel did not preserve the previous calibration");
+    plugin.advanceCalibration();
+    process(plugin, 2 * rate, background);
+    capture(5, 0.00028f);
+    capture(5, 0.00041f);
+    plugin.acceptWeakCalibration();
+    require(plugin.calibrationStage() == Stage::complete && plugin.measuredLevels().calibrated,
+            "Explicit acceptance did not commit the weak calibration");
     require(plugin.settings.getRawParameterValue("sensitivity")->load() == -12.0f
             && plugin.settings.getRawParameterValue("sampleGain")->load() == -48.0f,
             "Calibration changed the user's playback settings");
@@ -842,6 +1147,181 @@ void checkWavPitch(const juce::File& sample)
     }
 }
 
+void checkWavTail()
+{
+    const juce::TemporaryFile cleanup(juce::String(".wav"));
+    auto stream = cleanup.getFile().createOutputStream();
+    auto outputStream = std::unique_ptr<juce::OutputStream>(std::move(stream));
+    juce::WavAudioFormat format;
+    auto writer = format.createWriterFor(outputStream, juce::AudioFormatWriterOptions{}
+        .withSampleRate(8000.0).withNumChannels(1).withBitsPerSample(16));
+    require(writer != nullptr, "Could not create maximum-length tail fixture");
+    juce::AudioBuffer<float> fixture(1, 80000);
+    juce::FloatVectorOperations::fill(fixture.getWritePointer(0), 0.2f, fixture.getNumSamples());
+    require(writer->writeFromAudioSampleBuffer(fixture, 0, fixture.getNumSamples()), "Could not write tail fixture");
+    writer.reset();
+    PadTrigger plugin;
+    plugin.prepareToPlay(rate, blockSize);
+    require(plugin.loadSample(cleanup.getFile()).wasOk(), "Maximum-length sample did not load");
+    setParameter(plugin, "pitchSemitones", -24.0f);
+    setParameter(plugin, "pitchCents", -100.0f);
+    constexpr int onset = 100;
+    const auto tail = plugin.getTailLengthSeconds();
+    require(tail >= 10.0 * std::exp2(25.0 / 12.0) && tail < 43.0, "Reported tail does not cover minimum pitch");
+    const auto output = process(plugin, onset + static_cast<int>(std::ceil(tail * rate)) + 4,
+                                [onset](int at) { return stroke(at, onset, 0.1f); });
+    require(output[onset + 42 * rate] > 0.05f && output.back() == 0.0f,
+            "The pitched voice ended too early or overran the reported tail");
+}
+
+void benchmarkCallbacks()
+{
+    const juce::TemporaryFile sample(juce::String(".wav"));
+    {
+        std::unique_ptr<juce::OutputStream> stream = sample.getFile().createOutputStream();
+        juce::WavAudioFormat format;
+        auto writer = format.createWriterFor(stream, juce::AudioFormatWriterOptions{}
+            .withSampleRate(rate).withNumChannels(2).withBitsPerSample(16));
+        require(writer != nullptr, "Could not create callback benchmark fixture");
+        juce::AudioBuffer<float> fixture(2, 10 * rate);
+        for (int frame = 0; frame < fixture.getNumSamples(); ++frame)
+        {
+            fixture.setSample(0, frame, 0.04f * std::sin(frame * 0.042f));
+            fixture.setSample(1, frame, 0.02f * std::sin(frame * 0.066f));
+        }
+        require(writer->writeFromAudioSampleBuffer(fixture, 0, fixture.getNumSamples()),
+                "Could not write callback benchmark fixture");
+    }
+
+    using Clock = std::chrono::steady_clock;
+    constexpr int measurements = 12000;
+    const std::array<const char*, 4> scenarios {"WAV idle", "WAV one voice", "WAV dense", "MIDI modulated"};
+    std::cout << "rate\tframes\tscenario\teditor\tp50_us\tp95_us\tp99_us\tmax_us\tbudget_us\tover_budget\tmax_midi_bytes\n";
+    for (const int sampleRate : { 48000, 96000 })
+        for (const int frames : { 32, 64, 128 })
+            for (std::size_t scenario = 0; scenario < scenarios.size(); ++scenario)
+                for (const bool showEditor : { false, true })
+                {
+                    PadTrigger plugin;
+                    plugin.prepareToPlay(sampleRate, frames);
+                    require(plugin.loadSample(sample.getFile()).wasOk(), "Could not load benchmark WAV");
+                    setParameter(plugin, "retriggerMs", 8.0f);
+                    setParameter(plugin, "sampleGain", -24.0f);
+                    if (scenario == 2)
+                        setParameter(plugin, "lfoSemitones", 7.0f);
+                    if (scenario == 3)
+                    {
+                        setParameter(plugin, "soundMode", 1.0f);
+                        setParameter(plugin, "noteLengthMs", 800.0f);
+                        setParameter(plugin, "lfoCents", 80.0f);
+                        setParameter(plugin, "lfoSeconds", 0.2f);
+                    }
+                    std::unique_ptr<juce::AudioProcessorEditor> editor(showEditor ? plugin.createEditor() : nullptr);
+                    const auto run = [&]
+                    {
+                        juce::AudioBuffer<float> buffer(2, frames);
+                        juce::MidiBuffer midi;
+                        midi.ensureSize(2048); // The pinned JUCE VST3 wrapper reserves the same amount.
+                        std::vector<double> timings;
+                        timings.reserve(measurements);
+                        int maxMidiBytes = 0;
+                        const auto warmup = sampleRate / frames;
+                        const auto interval = sampleRate * 12 / 1000;
+                        const auto hitLength = sampleRate * 4 / 1000;
+                        for (int block = 0; block < warmup + measurements; ++block)
+                        {
+                            buffer.clear();
+                            midi.clear();
+                            if (scenario != 0)
+                                for (int frame = 0; frame < frames; ++frame)
+                                {
+                                    const auto absolute = block * frames + frame;
+                                    const auto age = absolute % (scenario == 1 ? sampleRate * 10 : interval);
+                                    if (age < hitLength)
+                                    {
+                                        const auto hit = 0.05f * std::exp(-age / (0.0005f * sampleRate))
+                                            * std::cos(age * (juce::MathConstants<float>::twoPi * 4000.0f / sampleRate));
+                                        buffer.setSample(0, frame, hit);
+                                        buffer.setSample(1, frame, -0.7f * hit);
+                                    }
+                                }
+                            const auto start = Clock::now();
+                            plugin.processBlock(buffer, midi);
+                            const auto elapsed = std::chrono::duration<double, std::micro>(Clock::now() - start).count();
+                            maxMidiBytes = std::max(maxMidiBytes, midi.data.size());
+                            if (block >= warmup)
+                                timings.push_back(elapsed);
+                        }
+                        return std::make_pair(std::move(timings), maxMidiBytes);
+                    };
+                    auto timed = std::async(std::launch::async, run);
+                    if (editor)
+                        while (timed.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+                        {
+                            juce::Timer::callPendingTimersSynchronously();
+                            editor->createComponentSnapshot(editor->getLocalBounds());
+                            timed.wait_for(std::chrono::milliseconds(33));
+                        }
+                    auto [timings, maxMidiBytes] = timed.get();
+                    std::sort(timings.begin(), timings.end());
+                    const auto budget = 1.0e6 * frames / sampleRate;
+                    const auto overruns = timings.end() - std::upper_bound(timings.begin(), timings.end(), budget);
+                    std::cout << sampleRate << '\t' << frames << '\t' << scenarios[scenario] << '\t' << showEditor
+                              << '\t' << timings[measurements / 2] << '\t' << timings[measurements * 95 / 100]
+                              << '\t' << timings[measurements * 99 / 100] << '\t' << timings.back()
+                              << '\t' << budget << '\t' << overruns << '\t' << maxMidiBytes << '\n';
+                }
+}
+
+void checkBusLayouts()
+{
+    const juce::TemporaryFile cleanup(juce::String(".wav"));
+    std::unique_ptr<juce::OutputStream> stream = cleanup.getFile().createOutputStream();
+    juce::WavAudioFormat format;
+    auto writer = format.createWriterFor(stream, juce::AudioFormatWriterOptions{}
+        .withSampleRate(rate).withNumChannels(2).withBitsPerSample(16));
+    require(writer != nullptr, "Could not create a stereo WAV fixture");
+    juce::AudioBuffer<float> fixture(2, 320);
+    juce::FloatVectorOperations::fill(fixture.getWritePointer(0), 0.7f, 320);
+    juce::FloatVectorOperations::fill(fixture.getWritePointer(1), -0.7f, 160);
+    fixture.clear(1, 160, 160);
+    require(writer->writeFromAudioSampleBuffer(fixture, 0, fixture.getNumSamples()), "Could not write stereo fixture");
+    writer.reset();
+
+    for (const int inputs : {1, 2})
+        for (const int outputs : {1, 2})
+        {
+            PadTrigger plugin;
+            juce::AudioProcessor::BusesLayout layout;
+            const auto mono = juce::AudioChannelSet::mono(), stereo = juce::AudioChannelSet::stereo();
+            layout.inputBuses.add(inputs == 1 ? mono : stereo);
+            layout.outputBuses.add(outputs == 1 ? mono : stereo);
+            require(plugin.setBusesLayout(layout), "A supported bus layout was rejected");
+            plugin.prepareToPlay(rate, 512);
+            require(plugin.loadSample(cleanup.getFile()).wasOk(), "Stereo fixture did not load");
+            juce::AudioBuffer<float> signal(juce::jmax(inputs, outputs), 512);
+            juce::MidiBuffer midi;
+            const auto strike = [&]
+            {
+                signal.clear();
+                signal.setSample(inputs - 1, 30, 0.1f);
+                plugin.processBlock(signal, midi);
+            };
+            strike();
+            require(midi.isEmpty() && signal.getSample(0, 191) > 0.1f, "WAV trigger failed in a supported bus layout");
+            if (outputs == 1)
+                require(std::abs(signal.getSample(0, 30)) < 0.001f, "Anti-phase stereo did not cancel on mono fold-down");
+            else
+                require(signal.getSample(0, 30) > 0.1f && signal.getSample(1, 30) < -0.1f
+                        && std::abs(signal.getSample(1, 191)) < 0.001f, "Stereo channel separation was lost");
+            setParameter(plugin, "soundMode", 1.0f);
+            strike();
+            require(notePitches(midi).size() == 1, "MIDI trigger failed in a supported bus layout");
+            for (int channel = 0; channel < outputs; ++channel)
+                require(signal.getMagnitude(channel, 0, 512) == 0.0f, "MIDI mode leaked mic audio");
+        }
+}
+
 void checkFrontPanel(const juce::File& sample)
 {
     PadTrigger plugin;
@@ -857,6 +1337,17 @@ void checkFrontPanel(const juce::File& sample)
         return keyboards;
     };
     require(inspect(inspect, editor) == 1, "The inline keyboard was missing in WAV mode");
+    juce::TextButton* toggle = nullptr;
+    for (auto* child : editor.getChildren())
+        if (auto* button = dynamic_cast<juce::TextButton*>(child); button != nullptr
+            && button->getButtonText() == "Hide note set")
+            toggle = button;
+    require(toggle != nullptr, "The WAV note-set view could not be collapsed");
+    const auto expandedHeight = editor.getHeight();
+    toggle->onClick();
+    require(editor.getHeight() < expandedHeight && inspect(inspect, editor) == 0, "The compact WAV view did not collapse");
+    toggle->onClick();
+    require(editor.getHeight() == expandedHeight && inspect(inspect, editor) == 1, "The inline keyboard could not be reopened");
     const juce::StringArray files { sample.getFullPathName() };
     require(editor.isInterestedInFileDrag(files), "The faceplate did not accept an inline WAV drop");
     editor.filesDropped(files, 100, 100);
@@ -923,6 +1414,26 @@ void checkScopeThreshold()
             "A negative threshold crossing was not highlighted");
     require(std::any_of(scope.begin(), scope.end(), [](const auto& bin) { return bin.aboveThreshold && !bin.hit; }),
             "The input threshold should be indicated separately from detected hits");
+}
+
+void checkScopeRejectionReasons()
+{
+    PadTrigger plugin;
+    plugin.prepareToPlay(rate, blockSize);
+    PadTrigger::Scope scope {};
+    process(plugin, 18000, [](int frame)
+    {
+        const auto ramp = 0.001f * juce::jlimit(0.0f, 1.0f, (frame - 12000) / 2400.0f);
+        return stroke(frame, 2400, 0.00013f) + stroke(frame, 5200, 0.02f)
+            + stroke(frame, 6200, 0.004f) + ramp;
+    });
+    plugin.readScope(scope);
+    using Rejection = StrokeDetector::Rejection;
+    for (auto reason : {Rejection::belowThreshold, Rejection::retrigger, Rejection::attack})
+        require(std::any_of(scope.begin(), scope.end(), [reason](const auto& bin) { return bin.rejection == reason; }),
+                "The mic scope lost a rejected attack reason");
+    require(std::count_if(scope.begin(), scope.end(), [](const auto& bin) { return bin.hit; }) == 1,
+            "A rejected attack was counted as a hit");
 }
 
 void run(const juce::File& sample)
@@ -999,27 +1510,42 @@ int main(int argc, char** argv)
     try
     {
         juce::ScopedJuceInitialiser_GUI init;
+        if (argc == 2 && juce::String(argv[1]) == "--benchmark")
+        {
+            benchmarkCallbacks();
+            return 0;
+        }
         const juce::TemporaryFile cleanup(juce::String(".wav"));
         const auto& sample = cleanup.getFile();
         createSample(sample);
         checkScopeThreshold();
+        checkScopeRejectionReasons();
         checkMidiPatterns();
         checkRetrigger();
         checkVelocityFloor();
+        checkVelocityDecisionWindow();
         checkPadRinging();
         checkHardStrikeRinging();
         checkDetectorTimingAndChannels();
+        checkWeakFollowUps();
+        checkGradualAttackDuringRinging();
         checkHostBlockLatency();
         checkModulatedHitTiming();
         checkMidiPitch();
+        checkSelfContainedPitchBend();
+        checkConcurrentPatternRestore();
         checkNoteRate();
         checkLfoAndPattern();
         checkLfoPatternPosition();
         checkPoolLearn();
         checkSampleHandoff(sample);
         checkWavPitch(sample);
+        checkWavTail();
+        checkBusLayouts();
         checkFrontPanel(sample);
         checkCalibrationCapture();
+        checkCalibrationWithLateAccentPeak();
+        checkProjectEditNotifications(sample);
         run(sample);
         if (argc == 2)
         {

@@ -12,6 +12,7 @@ public:
     ~PoolEditor() override;
     void paint(juce::Graphics&) override;
     void resized() override;
+    bool hasNotes() const { return selected.any(); }
 
 private:
     class Key final : public juce::TextButton

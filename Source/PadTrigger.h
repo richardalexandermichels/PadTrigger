@@ -11,13 +11,13 @@
 #include <optional>
 #include <vector>
 
-class PadTrigger final : public juce::AudioProcessor
+class PadTrigger final : public juce::AudioProcessor, private juce::Timer
 {
 public:
     enum class CalibrationStage
     {
         idle, startNoise, noise, readySoft, startSoft, soft, retrySoft,
-        readyHard, startHard, hard, retryHard, complete, weak, interrupted
+        readyHard, startHard, hard, retryHard, committing, complete, weak, interrupted
     };
     enum class PoolLearn { off, track, device };
 
@@ -35,6 +35,7 @@ public:
         float outputMin = 0.0f, outputMax = 0.0f;
         bool hit = false;
         bool aboveThreshold = false;
+        StrokeDetector::Rejection rejection = StrokeDetector::Rejection::none;
     };
 
     static constexpr int scopeSize = 256;
@@ -43,6 +44,7 @@ public:
     using Scope = std::array<ScopeFrame, scopeSize>;
 
     PadTrigger();
+    ~PadTrigger() override;
     void prepareToPlay(double sampleRate, int maxBlockSize) override;
     void releaseResources() override;
     bool isBusesLayoutSupported(const BusesLayout&) const override;
@@ -54,7 +56,7 @@ public:
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 10.0; }
+    double getTailLengthSeconds() const override;
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
     void setCurrentProgram(int) override {}
@@ -62,10 +64,13 @@ public:
     void changeProgramName(int, const juce::String&) override {}
     void getStateInformation(juce::MemoryBlock&) override;
     void setStateInformation(const void*, int) override;
+    void notifyStateEdited();
 
     juce::Result loadSample(const juce::File&);
     juce::String sampleDescription() const;
+    juce::File expectedSampleFile() const;
     void advanceCalibration();
+    void acceptWeakCalibration();
     void cancelCalibration();
     CalibrationStage calibrationStage() const { return calibration.load(); }
     int calibrationHitCount() const { return calibrationHitsRecorded.load(); }
@@ -77,6 +82,7 @@ public:
     int livePatternLength() const { return shownPatternLength.load(std::memory_order_relaxed); }
     int livePatternStep() const { return shownPatternStep.load(std::memory_order_relaxed); }
     float lfoPosition() const { return shownLfoPhase.load(std::memory_order_relaxed); }
+    float getLfoDepth(Lfo::Knob knob) const { return lfoDepth[knob]->load(std::memory_order_relaxed); }
     void setPoolLearn(PoolLearn source);
     void learnPoolPitch(int pitch, PoolLearn source);
     std::array<std::uint32_t, 4> takeLearnedNotes();
@@ -107,9 +113,11 @@ private:
     void renderSample(float&, float&, double step);
     void beginCalibration(CalibrationStage);
     void finishCalibration(CalibrationStage);
+    void timerCallback() override;
     void measureNoise(float);
     bool measureCalibrationHit(float amplitude, float gate, float quietGate);
-    void writeScope(float input, float left, float right, bool hit, bool aboveThreshold);
+    void writeScope(float input, float left, float right, bool hit, bool aboveThreshold,
+                    StrokeDetector::Rejection rejection);
     void measureNoteRate(const juce::MidiBuffer&, int frames);
 
     std::atomic<float>* const sensitivity;
@@ -127,6 +135,7 @@ private:
     std::atomic<float>* const lfoClock;
     std::atomic<float>* const lfoSeconds;
     std::atomic<float>* const lfoDivision;
+    juce::SpinLock midiRestoreLock;
     std::array<std::atomic<float>*, Lfo::targetCount> lfoDepth {};
     double lfoPhase = 0.0, lfoBpm = 120.0, lfoBarBeats = 4.0;
     std::atomic<float> shownLfoPhase { 0.0f };
@@ -160,6 +169,7 @@ private:
 
     std::atomic<CalibrationStage> calibration { CalibrationStage::idle };
     std::atomic<std::uint32_t> savedLevels { packLevels({}) };
+    std::atomic<bool> calibrationEdited { false };
     std::atomic<std::uint32_t> previewLevels { packLevels({}) };
     Levels candidate;
     int calibrationRemaining = 0, noiseWindow = 1, noiseFrames = 0;

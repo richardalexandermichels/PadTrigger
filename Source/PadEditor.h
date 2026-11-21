@@ -33,12 +33,14 @@ private:
 
     void timerCallback() override;
     void loadWav(const juce::String& path);
+    void browseWav();
     void updateLfoControls();
     void updatePitchLfoReadouts();
     void commitLfoSeconds();
     juce::Rectangle<int> lfoScopeBounds() const;
     void drawLfo(juce::Graphics&) const;
     void updateMode();
+    void updateNoteSetVisibility();
     void updateCalibration();
     void drawScope(juce::Graphics&, juce::Rectangle<int>, bool input) const;
     void drawMidiDisplay(juce::Graphics&) const;
@@ -51,10 +53,13 @@ private:
     PanelSelector bendRange { "MIDI bend range" };
     juce::Slider lfoDepth;
     juce::TextEditor lfoSeconds, wavPath;
+    std::unique_ptr<juce::FileChooser> sampleChooser;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> depthAttachment;
     juce::TextButton loadButton { "Load" };
+    juce::TextButton toggleNoteSet { "Hide note set" };
     juce::TextButton calibrateButton { "Calibrate" };
     juce::TextButton cancelButton { "Cancel" };
+    juce::TextButton acceptWeakButton { "Use anyway" };
     juce::TextButton resetPattern { "Reset Pattern" };
     juce::TextButton semitoneTarget { "Semitones" }, centsTarget { "Cents" };
     std::array<juce::Label, 2> pitchLfoReadouts;
@@ -63,6 +68,7 @@ private:
     juce::Image caseMaterial;
     juce::String sampleError;
     bool showingMidi = false;
+    bool showNoteSetInWav = true;
     bool lfoPeriodEdited = false;
     int recentMidi = 0;
     unsigned midiNoteCount = 0;
